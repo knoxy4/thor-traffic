@@ -1,0 +1,14 @@
+{
+  "gpu": { "usedMB": 9420, "totalMB": 12288, "util": 87 },
+  "procs": [
+    { "pid": 1180, "ppid": 4, "name": "explorer.exe", "agoSec": 86000, "cmd": "C:\\Windows\\explorer.exe" },
+    { "pid": 3020, "ppid": 1180, "name": "claude.exe", "agoSec": 7200, "cmd": "claude.exe" },
+    { "pid": 4100, "ppid": 3020, "name": "UnrealEditor.exe", "agoSec": 1560, "cmd": "\"D:\\UE_5.6\\Engine\\Binaries\\Win64\\UnrealEditor.exe\" \"D:\\Projects\\Outpost\\Outpost.uproject\" -NoSplash" },
+    { "pid": 7712, "ppid": 3020, "name": "UnrealEditor.exe", "agoSec": 400, "cmd": "\"D:\\UE_5.6\\Engine\\Binaries\\Win64\\UnrealEditor.exe\" \"D:\\Projects\\Outpost\\Outpost.uproject\" -game -windowed -ResX=2560 -ResY=1440 -ExecCmds=\"py capture_fps.py\" -abslog=D:\\agents\\codex-perf\\fps.log" },
+    { "pid": 8840, "ppid": 3020, "name": "Outpost-Win64-Shipping.exe", "agoSec": 25, "cmd": "\"D:\\Projects\\Outpost\\Saved\\StagedBuilds\\Windows\\Outpost-Win64-Shipping.exe\" -ResX=1920 -ResY=1080 -log=D:\\agents\\claude-audit\\smoke.log" },
+    { "pid": 5320, "ppid": 1180, "name": "ollama.exe", "agoSec": 3000, "cmd": "ollama.exe runner --model qwen3-8b --port 52310" },
+    { "pid": 9101, "ppid": 4100, "name": "ShaderCompileWorker.exe", "agoSec": 60, "cmd": "ShaderCompileWorker.exe -Unattended" },
+    { "pid": 9102, "ppid": 4100, "name": "ShaderCompileWorker.exe", "agoSec": 60, "cmd": "ShaderCompileWorker.exe -Unattended" },
+    { "pid": 9103, "ppid": 4100, "name": "ShaderCompileWorker.exe", "agoSec": 58, "cmd": "ShaderCompileWorker.exe -Unattended" }
+  ]
+}
