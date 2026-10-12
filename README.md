@@ -71,7 +71,7 @@ flowchart LR
     A3[Agent C] -- submit gpu --> Q
     L -- release / process exits --> D[dispatcher]
     Q --> D
-    D -- first in line is a job --> R["runner: quiet-GPU wait, lease tied to runner, start -Exe"]
+    D -- first in line is a job --> R["runner: waits for a quiet GPU, holds the lease, starts the command"]
     D -- first in line is a waiter --> K["kept for them until check-back"]
     R -- "exit code + logs" --> J[("jobs/id.json")]
     C[cop] -. every 5 s .-> P[processes]
