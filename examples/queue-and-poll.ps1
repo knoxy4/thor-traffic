@@ -2,7 +2,7 @@
 # else, read the result later. Thor starts the job itself when the lease frees.
 param([string]$Thor = (Join-Path $PSScriptRoot '..\thor.ps1'), [string]$By = 'agent1')
 $ErrorActionPreference = 'Stop'
-$out = & pwsh -NoProfile -File $Thor submit gpu -By $By -Exe 'cmd.exe' -ArgList '/c echo rendering & ping -n 4 127.0.0.1 >nul' -For 'demo render' -EstMin 1 -NoQuiet -Json | Out-String
+$out = & pwsh -NoProfile -File $Thor submit gpu -By $By -Exe 'cmd.exe' -ArgList '/c echo rendering & ping -n 4 127.0.0.1 >nul' -For 'demo render' -EstMin 1 -Json | Out-String
 $job = $out | ConvertFrom-Json
 Write-Host "queued $($job.id) ($($job.state))"
 # ...later (a later tool call, a later turn):

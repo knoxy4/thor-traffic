@@ -16,14 +16,15 @@ THOR TRAFFIC - this workstation is shared by several agents and a human. Leases 
 - Running long: <thor> renew <lease> -By <you> -EstMin <minutes still needed>. The queue's times move with it.
 - Held (exit 2) = you're queued. Don't spin. Prefer fire-and-forget:
   <thor> submit <lease> -By <you> -Exe <exe> -ArgList '<args>' -For '<what>' -EstMin <n> [-WorkDir <dir>]
-  Thor starts it the moment the lease is yours (after a quiet GPU unless -NoQuiet; the wait holds nothing and blocks
-  nobody, but use -NoQuiet for anything not timed, or it starts late). Read it back later:
+  Thor starts it the moment the lease is yours. A gpu job waits for a quiet GPU only with -Quiet; an editor or build job
+  waits for one unless -NoQuiet. The wait holds nothing and blocks nobody. Read it back later:
   <thor> job -JobId <id> -Json   (state, exit code, stdout/stderr log paths; "waiting" says what a starting job waits on)
   A launcher you hand to run or submit must wait for everything it starts: the lease ends when the launcher exits.
   Waiting by hand instead: run the same take again at the check-back time it gives you, or you drop out.
-- Timed work (fps, load times, frame costs) waits for a quiet GPU: <thor> run -By <you> -Exe ... or
-  & <thor> hold gpu -By <you> inside a script that launches its own processes.
+- Timed work (fps, load times, frame costs) waits for a quiet GPU: <thor> submit gpu -Quiet ..., <thor> run -By <you> -Exe ...
+  or & <thor> hold gpu -By <you> inside a script that launches its own processes.
 - A cop is always on: an agent -game or packaged run that the gpu lease doesn't cover is stopped after 45 s, with the
-  reason appended to its -abslog. A C++ build without the build lease is logged as a strike.
+  reason appended to its -abslog. A C++ build without the build lease is logged as a strike. A lease past its estimate with
+  nothing running and someone waiting gets released: renew -EstMin if the step is still going.
 - Never -Force someone else's lease. Ask the human.
 ```

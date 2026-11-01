@@ -1,9 +1,11 @@
-# quiet-wait-tests.ps1 - a wait for a quiet GPU holds nothing and keeps nothing for itself ("Standing aside" in thor.ps1).
-# Runs a copy of thor.ps1 with the GPU reading and the process list stubbed, in a throwaway state dir, so it needs no GPU
-# and can move the card from noisy to quiet under a waiter that is already running.
+# quiet-wait-tests.ps1 - a wait for a quiet GPU holds nothing and keeps nothing for itself ("Standing aside" in thor.ps1), a busy
+# lock never kills a waiter, the cop releases abandoned leases, and a gpu job waits for quiet only if it asks.
+# Runs a copy of thor.ps1 with the GPU reading and the process list stubbed, in a throwaway state dir and on its own mutexes, so
+# it needs no GPU, can't stall a live queue, and can move the card from noisy to quiet under a waiter that is already running.
 # Usage: pwsh tests\quiet-wait-tests.ps1 [-Shell pwsh|powershell] [-Tool <path to thor.ps1>] [-Keep]
 param([string]$Shell = 'pwsh', [string]$Tool = (Join-Path (Split-Path -Parent $PSScriptRoot) 'thor.ps1'), [switch]$Keep)
 $ErrorActionPreference = 'Stop'
+$env:THOR_SCRATCH = $null
 $Work = Join-Path ([IO.Path]::GetTempPath()) ("thor-quiet-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 $D = Join-Path $Work 'state'
 New-Item -ItemType Directory -Force $D | Out-Null
@@ -11,15 +13,17 @@ $tl = Join-Path $Work 'thor_stub.ps1'
 $stub = @'
 # ---- test stubs ----
 function Get-Gpu([int]$Samples = 3) { $v = ([IO.File]::ReadAllText((Join-Path $Dir 'fake_gpu.txt'))).Trim() -split ','; [pscustomobject]@{ usedMB = [int]$v[0]; totalMB = 12288; util = [int]$v[1] } }
-function Get-Procs { $f = Join-Path $Dir 'fake_procs.json'; if (Test-Path $f) { $o = [IO.File]::ReadAllText($f) | ConvertFrom-Json; return @($o) }; return @() }
+function Get-Procs { $script:ParentOf = @{}; $script:Info = @{}; $f = Join-Path $Dir 'fake_procs.json'; if (Test-Path $f) { $o = [IO.File]::ReadAllText($f) | ConvertFrom-Json; return @($o) }; return @() }
 if ($script:BoundKeys -notcontains 'SettleSec') { $SettleSec = 3 }
+if ($script:BoundKeys -notcontains 'ParkWarnMin') { $ParkWarnMin = 0.1 }
 if ($env:THOR_TEST_PASS) { [void](Dispatch-Pass); exit 0 }
 
 '@
 $src = [IO.File]::ReadAllText((Resolve-Path $Tool).Path)
 $mark = '# ---- verbs ---'
 if ($src.IndexOf($mark) -lt 0) { throw 'no verbs marker in the tool' }
-[IO.File]::WriteAllText($tl, $src.Replace($mark, $stub + $mark), (New-Object Text.UTF8Encoding $true))
+$mx = 'Global\T' + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '_'; $lockName = $mx + 'lease'
+[IO.File]::WriteAllText($tl, $src.Replace($mark, $stub + $mark).Replace('Global\ThorTraffic_', $mx), (New-Object Text.UTF8Encoding $true))
 
 $script:pass = 0; $script:fail = 0; $script:last = ''; $script:bgs = @()
 function Check($Name, $Cond) {
@@ -43,7 +47,7 @@ function Job($id) { $p = Join-Path $D "jobs\$id.json"; try { return (Get-Content
 function Submit { $o = & $Shell -NoProfile -ExecutionPolicy Bypass -File $tl submit @args -Json -Dir $D 2>&1 | ForEach-Object { "$_" }; $script:last = $o -join "`n"; return ($script:last | ConvertFrom-Json) }
 function LogText { $p = Join-Path $D 'lease.log'; if (Test-Path $p) { Get-Content $p -Raw } else { '' } }
 function Tidy($id) { if ($id) { TL job -JobId $id -Cancel | Out-Null } }
-$ok = '/c exit 0'; $exit7 = '/c exit 7'; $slow = '/c ping -n 7 127.0.0.1 >nul'
+$ok = '/c exit 0'; $exit7 = '/c exit 7'; $slow = '/c ping -n 7 127.0.0.1 >nul'; $slow15 = '/c ping -n 16 127.0.0.1 >nul'
 
 try {
     # --- run
@@ -119,7 +123,7 @@ try {
 
     # --- jobs
     Noisy
-    $j1 = Submit gpu -By j -Exe cmd.exe -ArgList $ok -For 'quiet job' -EstMin 5
+    $j1 = Submit gpu -By j -Exe cmd.exe -ArgList $ok -For 'quiet job' -Quiet -EstMin 5
     Check 'a quiet job on a noisy GPU stands aside' (Until { (E gpu $j1.runBy).parked -eq 'quiet' })
     Check 'it holds no lease' (-not (L gpu))
     Check 'the job says what it waits on' (Until { (Job $j1.id).waiting -match 'quiet' })
@@ -129,7 +133,7 @@ try {
     Check 'a -NoQuiet job behind it starts at once' (Until { (Job $j2.id).state -in @('running', 'done') } 15)
     Check 'and holds the lease itself' (Until { (L gpu).by -eq $j2.runBy -or (Job $j2.id).state -eq 'done' } 5)
     Check 'the -NoQuiet job finishes' (Until { (Job $j2.id).state -eq 'done' } 30)
-    $j3 = Submit gpu -By m -Exe cmd.exe -ArgList $ok -For 'second quiet job' -EstMin 5
+    $j3 = Submit gpu -By m -Exe cmd.exe -ArgList $ok -For 'second quiet job' -Quiet -EstMin 5
     Pass
     Check 'a second quiet job waits behind the first, no runner' ((Job $j3.id).state -eq 'queued' -and -not (Job $j3.id).runPid)
     Check 'a plain take walks past both' ((TL take gpu -By n) -eq 0)
@@ -141,14 +145,14 @@ try {
 
     # cancel while parked
     Noisy
-    $j4 = Submit gpu -By p -Exe cmd.exe -ArgList $ok -For 'to cancel' -EstMin 5
+    $j4 = Submit gpu -By p -Exe cmd.exe -ArgList $ok -For 'to cancel' -Quiet -EstMin 5
     Check 'job parks (cancel case)' (Until { (E gpu $j4.runBy).parked -eq 'quiet' })
     TL job -JobId $j4.id -Cancel | Out-Null
     Check 'cancelled, no queue place, no lease' ((Job $j4.id).state -eq 'cancelled' -and -not (E gpu $j4.runBy) -and -not (L gpu))
     Check 'it never took the lease' ((LogText) -notmatch "take gpu $([regex]::Escape($j4.runBy)) until")
 
     # runner killed while parked
-    $j5 = Submit gpu -By r -Exe cmd.exe -ArgList $ok -For 'to kill' -EstMin 5
+    $j5 = Submit gpu -By r -Exe cmd.exe -ArgList $ok -For 'to kill' -Quiet -EstMin 5
     Check 'job parks (kill case)' (Until { (E gpu $j5.runBy).parked -eq 'quiet' })
     $rp = [int](Job $j5.id).runPid
     foreach ($c in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$rp" -ErrorAction SilentlyContinue)) { Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -160,19 +164,19 @@ try {
     Check 'and its place is gone' (-not (E gpu $j5.runBy))
 
     # timed out on quiet
-    $j6 = Submit gpu -By t -Exe cmd.exe -ArgList $ok -For 'times out' -EstMin 1 -TimeoutMin 0.1
+    $j6 = Submit gpu -By t -Exe cmd.exe -ArgList $ok -For 'times out' -Quiet -EstMin 1 -TimeoutMin 0.1
     Check 'a job that never gets quiet fails with why, no lease' (Until { (Job $j6.id).state -eq 'failed' -and (Job $j6.id).why -match 'quiet' } 30)
     Check 'no lease and no place left behind' (-not (L gpu) -and -not (E gpu $j6.runBy))
 
     # --- submit carries quiet's switches
     Calm
     Procs '[{"kind":"editor","cpp":false,"pid":5,"name":"UnrealEditor.exe","cmd":"x","full":"UnrealEditor.exe Other.uproject","started":"2026-01-01T00:00:00Z"}]'
-    $s1 = Submit gpu -By sa -Exe cmd.exe -ArgList $ok -For 'strict' -EstMin 1
+    $s1 = Submit gpu -By sa -Exe cmd.exe -ArgList $ok -For 'strict' -Quiet -EstMin 1
     Check 'a plain quiet job parks on an open editor' (Until { (E gpu $s1.runBy).parked -eq 'quiet' })
     $s2 = Submit gpu -By sb -Exe cmd.exe -ArgList $ok -For 'allows the editor' -AllowEditor -EstMin 1
     Check 'submit records -AllowEditor on the job' ((Job $s2.id).allowEditor -eq $true)
     Check 'that job goes past the parked one and runs with the editor open' (Until { (Job $s2.id).state -eq 'done' } 25)
-    $s3 = Submit gpu -By sc -Exe cmd.exe -ArgList $ok -For 'same as strict' -EstMin 1
+    $s3 = Submit gpu -By sc -Exe cmd.exe -ArgList $ok -For 'same as strict' -Quiet -EstMin 1
     Pass
     Check 'a job with the parked one''s switches waits unstarted' ((Job $s3.id).state -eq 'queued' -and -not (Job $s3.id).runPid)
     Tidy $s1.id; Tidy $s3.id
@@ -210,6 +214,143 @@ try {
     $rc = TL hold build -By bc -HolderPid $PID
     Check 'hold on the build lease does not wait for quiet' ($rc -eq 0)
     TL release build -By bc | Out-Null
+
+    # --- a busy lock never kills a waiter, and a job's end still lands
+    Noisy; Procs ''
+    $hl = Join-Path $Work 'hold_lock.ps1'
+    Set-Content $hl "param([int]`$Sec); `$m = New-Object Threading.Mutex(`$false, '$lockName'); [void]`$m.WaitOne(); Start-Sleep `$Sec; `$m.ReleaseMutex()"
+    function Hold-Lock([int]$Sec) { $p = Start-Process $Shell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hl`"", '-Sec', "$Sec" -PassThru -WindowStyle Hidden; $null = $p.Handle; $script:bgs += $p; Start-Sleep 2; return $p }
+    $k1 = Submit gpu -By lk -Exe cmd.exe -ArgList $ok -For 'survives the lock' -Quiet -EstMin 1
+    Check 'job parks (busy lock case)' (Until { (E gpu $k1.runBy).parked -eq 'quiet' })
+    $hp = Hold-Lock 22
+    $hp.WaitForExit(30000) | Out-Null
+    Start-Sleep 3
+    $jk = Job $k1.id
+    Check 'a parked runner outlives a lock busy past 15 s' ($jk.state -eq 'starting' -and (Get-Process -Id ([int]$jk.runPid) -ErrorAction SilentlyContinue))
+    Calm
+    Check 'and it runs once quiet' (Until { (Job $k1.id).state -eq 'done' } 30)
+    $k2 = Submit gpu -By ll -Exe cmd.exe -ArgList $slow -For 'ends under a busy lock' -NoQuiet -EstMin 1
+    Check 'job runs (busy lock at its end)' (Until { (Job $k2.id).state -eq 'running' } 15)
+    $hp = Hold-Lock 22
+    $hp.WaitForExit(30000) | Out-Null
+    Check 'a job that ends during a busy lock still records its exit' (Until { (Job $k2.id).state -eq 'done' -and (Job $k2.id).exit -eq 0 } 25)
+    Check 'and frees its lease' (-not (L gpu))
+
+    # --- abandoned leases
+    Calm; Procs ''
+    $scr = Join-Path $Work 'scratch'; New-Item -ItemType Directory -Force (Join-Path $scr 'ra') | Out-Null
+    function Cop { TL cop -Once -ScratchDir $scr @args | Out-Null }
+    function Stale([string]$Lease, [string]$Who) { TL take $Lease -By $Who -EstMin 0.01 -For 'forgot about it' | Out-Null; Start-Sleep 2 }
+    function Waiter([string]$Lease, [string]$Who) { TL take $Lease -By $Who | Out-Null }
+    function Clear-Up([string]$Lease, [string]$Holder, [string]$Who) { TL unqueue $Lease -By $Who | Out-Null; TL release $Lease -By $Holder | Out-Null }
+    $fast = @('-ReapAfterMin', '0.01')
+
+    Stale gpu ra; Waiter gpu rw
+    Cop @fast
+    TL status | Out-Null
+    Check 'the lease says nothing has been running' ($last -match 'nothing running since')
+    Start-Sleep 2
+    Cop @fast
+    Check 'an abandoned lease is released when someone waits' (-not (L gpu))
+    Check 'the reap is logged' ((LogText) -match 'reap gpu ra ')
+    $told = Join-Path $scr 'ra\THOR_COP.txt'
+    Check 'the holder is told' ((Test-Path $told) -and (Get-Content $told -Raw) -match 'released your gpu lease')
+    Check 'the waiter gets it' ((TL take gpu -By rw) -eq 0)
+    TL release gpu -By rw | Out-Null
+
+    Stale gpu rs; Waiter gpu rw0
+    TL cop -Once -ReapAfterMin 0.01 | Out-Null; Start-Sleep 2; TL cop -Once -ReapAfterMin 0.01 | Out-Null
+    Check 'with no -ScratchDir it still releases, cleanly' (-not (L gpu) -and $last -notmatch 'reap pass failed')
+    TL unqueue gpu -By rw0 | Out-Null
+
+    TL take gpu -By rb -EstMin 30 | Out-Null; Waiter gpu rw2; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'inside its estimate: not reaped' ((L gpu).by -eq 'rb')
+    Clear-Up gpu rb rw2
+
+    Stale gpu rc; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'nobody waiting: not reaped' ((L gpu).by -eq 'rc')
+    Waiter gpu rw3; Cop @fast
+    Check 'and it goes as soon as someone waits' (-not (L gpu))
+    TL unqueue gpu -By rw3 | Out-Null
+
+    Procs '[{"kind":"game","cpp":false,"pid":999991,"name":"UnrealEditor.exe","cmd":"x","full":"UnrealEditor.exe Other.uproject -game","started":"2026-01-01T00:00:00Z"}]'
+    Stale gpu rd; Waiter gpu rw4; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a game on the box: gpu lease not reaped' ((L gpu).by -eq 'rd')
+    Clear-Up gpu rd rw4; Procs ''
+
+    Noisy
+    Stale gpu re; Waiter gpu rw5; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a busy card: gpu lease not reaped' ((L gpu).by -eq 're')
+    Clear-Up gpu re rw5; Calm
+
+    Procs '[{"kind":"editor","cpp":false,"pid":999992,"name":"UnrealEditor.exe","cmd":"x","full":"UnrealEditor.exe Other.uproject","started":"2026-01-01T00:00:00Z"}]'
+    Stale editor rf; Waiter editor rw6; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'an open editor: editor lease not reaped' ((L editor).by -eq 'rf')
+    Clear-Up editor rf rw6; Procs ''
+    Stale editor rf2; Waiter editor rw7; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'no editor open: editor lease reaped' (-not (L editor))
+    TL unqueue editor -By rw7 | Out-Null
+
+    Procs '[{"kind":"build","cpp":true,"pid":999993,"name":"dotnet.exe","cmd":"x","full":"dotnet.exe UnrealBuildTool.dll OtherEditor Win64","started":"2026-01-01T00:00:00Z"}]'
+    Stale build rg; Waiter build rw8; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a C++ build running: build lease not reaped' ((L build).by -eq 'rg')
+    Clear-Up build rg rw8
+    Procs '[{"kind":"commandlet","cpp":false,"pid":999995,"name":"UnrealEditor-Cmd.exe","cmd":"x","full":"UnrealEditor-Cmd.exe Other.uproject -run=Cook","started":"2026-01-01T00:00:00Z"}]'
+    Stale build rg3; Waiter build rw15; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a cook running: build lease not reaped' ((L build).by -eq 'rg3')
+    Clear-Up build rg3 rw15
+    Procs '[{"kind":"build","cpp":false,"pid":999994,"name":"cargo.exe","cmd":"x","full":"cargo.exe build","started":"2026-01-01T00:00:00Z"}]'
+    Stale build rg2; Waiter build rw9; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'someone else''s cargo does not keep a build lease alive' (-not (L build))
+    TL unqueue build -By rw9 | Out-Null; Procs ''
+
+    $rj = Submit gpu -By rh -Exe cmd.exe -ArgList $slow15 -For 'long job' -NoQuiet -EstMin 0.01
+    Check 'job runs (reap case)' (Until { (Job $rj.id).state -eq 'running' } 15)
+    Waiter gpu rw10; Start-Sleep 2; Cop @fast; Start-Sleep 1; Cop @fast
+    Check 'a running job is never reaped' ((Job $rj.id).state -eq 'running' -and (LogText) -notmatch 'reap gpu rh')
+    Check 'and finishes' (Until { (Job $rj.id).state -eq 'done' } 25)
+    TL unqueue gpu -By rw10 | Out-Null
+
+    Stale gpu ri; Waiter gpu rw11; Cop @fast
+    TL renew gpu -By ri -EstMin 5 | Out-Null
+    TL status | Out-Null
+    Check 'a renew clears the idle mark' ($last -notmatch 'nothing running since')
+    Start-Sleep 2; Cop @fast
+    Check 'a renew keeps it' ((L gpu).by -eq 'ri')
+    Clear-Up gpu ri rw11
+
+    Stale gpu rk; Waiter gpu rw12; Cop -ReapAfterMin 0; Start-Sleep 2; Cop -ReapAfterMin 0
+    Check '-ReapAfterMin 0 turns it off' ((L gpu).by -eq 'rk')
+    Clear-Up gpu rk rw12
+
+    Stale gpu rm; Waiter gpu rw13; Cop -ReapAfterMin 5; Start-Sleep 2; Cop -ReapAfterMin 5
+    Check 'not before -ReapAfterMin has passed' ((L gpu).by -eq 'rm')
+    Clear-Up gpu rm rw13
+
+    Stale gpu rn; Waiter gpu rw14; Cop @fast; Start-Sleep 2
+    TL cop -Once -ScratchDir $scr -CopDryRun -ReapAfterMin 0.01 | Out-Null
+    Check '-CopDryRun only says what it would release' ((L gpu).by -eq 'rn' -and $last -match 'would release')
+    Clear-Up gpu rn rw14
+
+    # --- a gpu job waits for quiet only if it asks
+    Noisy; Procs ''
+    $q1 = Submit gpu -By qa -Exe cmd.exe -ArgList $ok -For 'a still' -EstMin 1
+    Check 'plain gpu submit does not wait for quiet' (Until { (Job $q1.id).state -eq 'done' } 15)
+    Check 'and never parked' ((LogText) -notmatch 'park gpu qa\.')
+    $rc = TL submit gpu -By qb -Exe cmd.exe -ArgList $ok -For 'reminder' -EstMin 1
+    Check 'submit says timed work adds -Quiet' ($rc -eq 0 -and $last -match 'add -Quiet')
+    $rc = TL submit gpu -By qc -Exe cmd.exe -ArgList $ok -For 'both' -Quiet -NoQuiet -EstMin 1
+    Check '-Quiet with -NoQuiet is refused' ($rc -eq 1 -and $last -match 'Quiet')
+    $q4 = Submit gpu -By qd -Exe cmd.exe -ArgList $ok -For 'old habit' -NoQuiet -EstMin 1
+    Check '-NoQuiet still works' (Until { (Job $q4.id).state -eq 'done' } 15)
+    $q5 = Submit gpu -By qe -Exe cmd.exe -ArgList $ok -For 'a timing run' -Quiet -EstMin 1
+    Check '-Quiet waits for quiet' (Until { (E gpu $q5.runBy).parked -eq 'quiet' })
+    Check 'a long park warns in the log' (Until { (LogText) -match "park-long gpu $([regex]::Escape($q5.runBy)) " } 20)
+    Check 'and says how out' ((LogText) -match 'park-long .*without -Quiet')
+    Tidy $q5.id
+    $q6 = Submit gpu -By qf -Exe cmd.exe -ArgList $ok -For 'names a gate' -MaxVramGB 1 -EstMin 1
+    Check 'naming one of quiet''s switches asks for quiet' (Until { (E gpu $q6.runBy).parked -eq 'quiet' })
+    Tidy $q6.id
 
     # --- the colour board
     $a2 = Bg run gpu -By a2 -Exe cmd.exe -ArgList $ok -TimeoutMin 1 -SettleSec 3

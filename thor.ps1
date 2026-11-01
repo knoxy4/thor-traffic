@@ -12,13 +12,13 @@
 #   thor.ps1 release <lease> -By <who> [-Force]
 #   thor.ps1 unqueue <lease> -By <who>
 #   thor.ps1 submit  [gpu|editor|build] -By <who> -Exe <path> [-ArgList '<args>'] [-WorkDir <dir>] [-For 'what'] [-EstMin 20]
-#                    [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
-#   thor.ps1 job     [-JobId <id>] [-By <who>] [-Json] [-Cancel]
+#                    [-Quiet] [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
+#   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
 #   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
 #   thor.ps1 quiet   [-By <who>] [-Wait] [-TimeoutMin 30] [-SettleSec 20] [-MaxVramGB 3.5] [-MaxUtil 50] [-AllowEditor] [-AllowBuild]
 #   thor.ps1 watch   [-Every 5] [-NoCop] [-Plain] [-Once] [-NoToast] [-Frame -Cols 150 -Rows 50] [-Fixture <demo.json>]
-#   thor.ps1 cop     [-Every 5] [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>]
+#   thor.ps1 cop     [-Every 5] [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]
 #
 # State lives in -Dir (default $env:THOR_DIR, else %ProgramData%\ThorTraffic): leases\<name>.json, queue\<name>.json,
 # jobs\<id>.json and lease.log. Every change happens under one named mutex, so two takes can never both win.
@@ -41,13 +41,14 @@
 # keeps its place, but the lease isn't kept for it and whoever can use it now takes it (a plain take, a -NoQuiet job). Once
 # quiet it unparks, reclaims its place and the lease is kept for it through the settle. A queued job behind one parked for
 # quiet with the same quiet switches waits unstarted, because it would only wait too. A holder that calls run or hold lets
-# its own lease go while the GPU is noisy.
+# its own lease go while the GPU is noisy. A waiter parked -ParkWarnMin (15) says so in lease.log as park-long, then hourly,
+# and the board toasts it.
 #
 # Dispatcher. submit puts a launch command in the queue as a job (jobs\<id>.json) under its own name <who>.j<n>. It needs
 # no check-back: whenever a lease is unheld and its queue's first ready entry is a job, the dispatcher starts it - from the cop,
 # from a watch window, or from the submit itself when the lease is free now - as `run -JobId <id>` in a detached, windowless
-# process: wait for a quiet GPU (unless -NoQuiet, with the job's own -AllowEditor, -AllowBuild, -MaxVramGB, -MaxUtil and
-# -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
+# process: wait for a quiet GPU if the job waits for one (see Quiet GPU; with the job's own -AllowEditor, -AllowBuild, -MaxVramGB,
+# -MaxUtil and -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
 # stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting (its runner is up, and may
 # be waiting for quiet: the waiting field says why), running, done, failed, cancelled, expired (never started within
 # -TimeoutMin), lost (runner killed). Read a job back with job -JobId <id> -Json.
@@ -56,8 +57,9 @@
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
 # editor (-AllowEditor ignores it) and no UBT / UAT / shader-compile / cargo work (-AllowBuild ignores it). quiet -Wait,
 # run, hold and dispatched jobs need it to hold for -SettleSec in a row. Windows doesn't report VRAM per process, so the
-# card total gates. run and jobs wait for it on any lease unless -NoQuiet: with an editor open, that is what keeps a build
-# job from failing at the link. hold waits for it on gpu only.
+# card total gates. run waits for it on any lease unless -NoQuiet, and hold on gpu only. A job on the gpu lease waits only if
+# it asks, with -Quiet or one of quiet's switches, because most gpu work isn't timed. A job on the editor or build lease waits
+# unless -NoQuiet: with an editor open, that is what keeps a build job from failing at the link.
 #
 # The cop (inside watch unless -NoCop, or alone as `cop`; install-cop.ps1 runs it at logon; one cop at a time):
 #   - stops agent -game and packaged runs that the gpu lease doesn't cover, once they are -CopGraceSec old (45 s). Never
@@ -71,12 +73,18 @@
 #   - a stop is logged (cop-kill) and the reason + the fix are appended to the run's -abslog file and, with -ScratchDir,
 #     to <ScratchDir>\<who>\THOR_COP.txt, where the agent will see it;
 #   - a C++ build (UBT/UAT) without the build lease is logged as a strike, never stopped (a killed link can corrupt
-#     binaries for everyone).
+#     binaries for everyone);
+#   - it releases abandoned leases. A lease past its estimate with nothing of its kind running (editor: an editor or commandlet;
+#     build: UBT, UAT or a commandlet; gpu: a game, packaged run, local LLM or image generation, or the card over -MaxUtil; any
+#     lease: the command run started) gets idleSince on its file. Still idle after -ReapAfterMin (10) with someone in its queue,
+#     it goes: reap in lease.log, a toast and, with -ScratchDir, a note in <ScratchDir>\<who>\THOR_COP.txt. A renew clears the
+#     mark and -ReapAfterMin 0 turns this off. Anything on the box counts as use, whoever's it is, so this errs toward keeping a lease.
 #
 # Board (watch). A live terminal view for the human: GPU memory and load, each lease with its holder and countdown, the
 # queue with expected starts, the next 90 minutes as a timeline, what is running tagged with the lease covering it, and
 # lease.log. Alerts are Windows toasts for leases changing hands, holders past their estimate, late waiters, cop kills,
-# strikes, dispatched/finished jobs, uncovered runs and the GPU going quiet. Keys: q quits, t toggles alerts.
+# strikes, released leases, long waits for quiet, dispatched/finished jobs, uncovered runs and the GPU going quiet. Keys: q
+# quits, t toggles alerts.
 # -Frame prints one coloured frame and exits (docs, CI). -Fixture replays fake processes and GPU readings (demo, tests).
 #
 # Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first), 3 not quiet.
@@ -101,6 +109,9 @@ param(
     [string]$Exe,
     [string]$ArgList = '',
     [switch]$NoQuiet,
+    [switch]$Quiet,
+    [double]$ParkWarnMin = 15,
+    [double]$ReapAfterMin = 10,
     [int]$Every = 5,
     [int]$LogLines = 10,
     [switch]$Once,
@@ -161,18 +172,19 @@ function IsoFine([DateTime]$T) { $T.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm
 function Mins([DateTime]$T) { [int][Math]::Max(0, [Math]::Ceiling(($T - [DateTime]::UtcNow).TotalMinutes)) }
 function Log-Line([string]$Line) { [IO.File]::AppendAllText($LogFile, "$(Now-Iso) $Line`r`n", $Utf8) }
 
+$script:LockWaitSec = 45   # under a typical tool call's limit; Wait-Lease raises it, because a waiter has nowhere better to be
 function With-Lock([scriptblock]$Body) {
-    # Held for a read-modify-write only (milliseconds); waits never sit inside it.
+    # Held for a read-modify-write only; waits never sit inside it, and neither do slow reads.
     $m = New-Object Threading.Mutex($false, 'Global\ThorTraffic_lease')
     $got = $false
     try {
-        try { $got = $m.WaitOne(15000) }
+        try { $got = $m.WaitOne($script:LockWaitSec * 1000) }
         catch {
             $e = $_.Exception
             while ($e) { if ($e -is [Threading.AbandonedMutexException]) { $got = $true; break }; $e = $e.InnerException }
             if (-not $got) { throw }
         }
-        if (-not $got) { throw 'the lease mutex stayed busy for 15 s' }
+        if (-not $got) { throw "the lease mutex stayed busy for $($script:LockWaitSec) s" }
         & $Body
     } finally {
         if ($got) { $m.ReleaseMutex() }
@@ -215,6 +227,7 @@ function Describe-Lease($L) {
     }
     if ($L.pid) { $s += ", tied to pid $($L.pid)" }
     if ($L.childPid) { $s += ", running pid $($L.childPid)" }
+    if ($L.idleSince) { $s += ", nothing running since $(Local-Hm $L.idleSince)" }
     return $s
 }
 
@@ -430,6 +443,8 @@ function Do-Submit {
     $tmo = if ($script:BoundKeys -contains 'TimeoutMin') { [double]$TimeoutMin } else { [double]$JobWaitMin }
     $est = Est-Minutes $Lease
     New-Item -ItemType Directory -Force $JobDir | Out-Null
+    # Reading a day of job files is slow, so it happens before the lock. A job submitted meanwhile is in the queue or holds a lease, and both are read under it.
+    $liveJobs = @(Recent-Jobs 24 | Where-Object { [string]$_.state -in @('queued', 'starting', 'running') } | ForEach-Object { [string]$_.runBy })
     $res = With-Lock {
         $now = [DateTime]::UtcNow
         $cur = Read-Lease $Lease; $state = Lease-State $cur
@@ -439,7 +454,7 @@ function Do-Submit {
         $used = @{}; if ($holder) { $used[$holder] = 1 }
         foreach ($e in $q) { $used[[string]$e.by] = 1 }
         foreach ($nm in $Names) { $l2 = Read-Lease $nm; if ($l2) { $used[[string]$l2.by] = 1 } }
-        foreach ($oj in (Recent-Jobs 24)) { if ([string]$oj.state -in @('queued', 'starting', 'running')) { $used[[string]$oj.runBy] = 1 } }
+        foreach ($rb in $liveJobs) { $used[$rb] = 1 }
         $jn = 1; while ($used.ContainsKey("$By.j$jn")) { $jn++ }
         $runBy = "$By.j$jn"
         $id = "$runBy-$($now.ToLocalTime().ToString('MMdd-HHmmss'))"
@@ -467,6 +482,7 @@ function Do-Submit {
         $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
         Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
     } else { Say "job $($res.id): $Lease was free; $($j.state) now" Green }
+    if ($Lease -eq 'gpu' -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
@@ -667,44 +683,110 @@ function Wait-Quiet([DateTime]$Deadline) {
 function Wait-Lease([string]$Name, [int]$Min, [int]$TiePid, [DateTime]$Deadline, [bool]$NeedQuiet) {
     # run's and hold's wait: in the queue until the lease is ours to take; then, if asked, until the GPU has been quiet for
     # SettleSec; only then the take (header: Standing aside). Returns the take, or @{ ok = $false; code; msg; why } at the deadline.
-    $ready = -not $NeedQuiet; $park = ''; $since = $null; $said = [DateTime]::MinValue; $lastMsg = ''; $logged = $false
+    $script:LockWaitSec = 300
+    $ready = -not $NeedQuiet; $park = ''; $since = $null; $said = [DateTime]::MinValue; $lastMsg = ''; $logged = $false; $parkedAt = $null; $warnAt = $null; $fails = 0
     while ($true) {
-        if ($JobId) {
-            $jn = With-Lock { Read-Job $JobId }
-            if ($jn -and [string]$jn.state -ne 'starting') { [void](Do-Unqueue $Name); return @{ ok = $false; code = 1; msg = "job $JobId is $($jn.state): nothing started"; why = '' } }
-        }
-        $res = Try-Take $Name $Min $TiePid -Ready $ready -NeedQuiet $NeedQuiet -Park $park
-        if ($res.ok) { return $res }
-        $now = [DateTime]::UtcNow
-        if (-not $res.turn) {
-            $since = $null; $ready = -not $NeedQuiet
-            if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 2; msg = "gave up after $TimeoutMin min and left the queue; $(Wait-Text $res $Name)"; why = "gave up waiting for $Name after $TimeoutMin min" } }
-            if (($now - $said).TotalSeconds -ge 60) { Say "waiting: $(Wait-Text $res $Name)" Yellow; $said = $now }
+        try {
+            if ($JobId) {
+                $jn = With-Lock { Read-Job $JobId }
+                if ($jn -and [string]$jn.state -ne 'starting') { [void](Do-Unqueue $Name); return @{ ok = $false; code = 1; msg = "job $JobId is $($jn.state): nothing started"; why = '' } }
+            }
+            $res = Try-Take $Name $Min $TiePid -Ready $ready -NeedQuiet $NeedQuiet -Park $park
+            $fails = 0
+            if ($res.ok) { return $res }
+            $now = [DateTime]::UtcNow
+            if (-not $res.turn) {
+                $since = $null; $ready = -not $NeedQuiet
+                if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 2; msg = "gave up after $TimeoutMin min and left the queue; $(Wait-Text $res $Name)"; why = "gave up waiting for $Name after $TimeoutMin min" } }
+                if (($now - $said).TotalSeconds -ge 60) { Say "waiting: $(Wait-Text $res $Name)" Yellow; $said = $now }
+                Start-Sleep -Seconds 5
+                continue
+            }
+            $reasons = Quiet-Reasons (Get-Gpu) (Get-Procs) (Get-Leases)
+            if ($reasons.Count) {
+                $since = $null; $ready = $false
+                $msg = $reasons -join '; '
+                if ($res.mine) { [void](Do-Release $Name); Say "your $Name lease is let go while the GPU is noisy; you keep a queue place" Yellow }
+                if ($msg -ne $lastMsg -or ($now - $said).TotalSeconds -ge 60) {
+                    Say "waiting for a quiet GPU, $Name left free: $msg" Yellow; $lastMsg = $msg; $said = $now
+                    if ($JobId) { [void](Set-Job $JobId @{ waiting = "no quiet GPU: $msg" } @('starting')) }
+                }
+                if (-not $logged) { $logged = $true; $parkedAt = $now; $warnAt = $now.AddMinutes($ParkWarnMin); Log-Line "park $Name $By waiting for a quiet GPU, $Name left free: $(Short $msg 120)" }
+                if ($now -ge $warnAt) {
+                    Log-Line "park-long $Name $By $([int][Math]::Ceiling(($now - $parkedAt).TotalMinutes)) min waiting for a quiet GPU: $(Short $msg 100). Not a timing run? $(if ($JobId) { 'Cancel it and submit without -Quiet.' } else { 'Use -NoQuiet.' })"
+                    $warnAt = $now.AddMinutes(60)
+                }
+                if ($park -ne 'quiet') { $park = 'quiet'; continue }
+            } else {
+                if (-not $since) {
+                    $since = $now; Say "quiet; settling $SettleSec s"
+                    if ($JobId) { [void](Set-Job $JobId @{ waiting = '' } @('starting')) }
+                }
+                if ($park) { $park = ''; continue }
+                if (($now - $since).TotalSeconds -ge $SettleSec) { $ready = $true; continue }
+            }
+            if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 3; msg = "no quiet GPU within $TimeoutMin min; left the $Name queue, nothing started"; why = "no quiet GPU within $TimeoutMin min" } }
+            Start-Sleep -Seconds 2
+        } catch {
+            # Everything is in files and each look starts over, so a busy lock or a failed process list costs one look, not the job.
+            $fails++
+            Say "look failed, trying again ($fails): $($_.Exception.Message)" Yellow
+            if ($fails -ge 30 -or [DateTime]::UtcNow -ge $Deadline) { return @{ ok = $false; code = 1; msg = "gave up after $fails failed looks: $($_.Exception.Message)"; why = "gave up after $fails failed looks: $($_.Exception.Message)" } }
             Start-Sleep -Seconds 5
+        }
+    }
+}
+function Lease-Busy([string]$Name, $L, $Procs) {
+    # Is anything using this lease? A command it started, or anything of its kind on the box, whoever's it is: a false yes only keeps a lease a while longer.
+    if ($L.childPid -and (Get-Process -Id ([int]$L.childPid) -ErrorAction SilentlyContinue)) { return $true }
+    switch ($Name) {
+        'editor' { return @($Procs | Where-Object { $_.kind -in @('editor', 'commandlet') }).Count -gt 0 }
+        'build' { return @($Procs | Where-Object { $_.kind -eq 'commandlet' -or ($_.kind -eq 'build' -and $_.cpp) }).Count -gt 0 }
+        'gpu' {
+            if (@($Procs | Where-Object { $_.kind -in @('game', 'packaged', 'llm', 'imagegen') }).Count) { return $true }
+            $card = Get-Gpu
+            return (-not $card) -or $card.util -gt $MaxUtil
+        }
+    }
+    return $true
+}
+function Reap-Pass($Procs, $Leases) {
+    # Frees a lease nobody is using (header: the cop). Past its estimate and nothing running: the idle clock starts. Still idle after -ReapAfterMin with someone waiting: it goes.
+    $out = @()
+    if ($ReapAfterMin -le 0) { return , $out }
+    foreach ($n in $Names) {
+        $x = $Leases[$n]
+        if ($x.state -ne 'live' -or -not $x.lease.eta) { continue }
+        $L = $x.lease; $now = [DateTime]::UtcNow
+        $idle = (To-Utc $L.eta) -lt $now -and -not (Lease-Busy $n $L $Procs)
+        if (-not $idle -and -not $L.idleSince) { continue }
+        $waiting = (Live-Queue $n ([string]$L.by)).Count
+        if ($idle -and $L.idleSince -and $waiting -and ($now - (To-Utc $L.idleSince)).TotalMinutes -ge $ReapAfterMin) {
+            $why = "past its estimate since $(Local-Hm $L.eta), nothing running since $(Local-Hm $L.idleSince), $waiting waiting"
+            if ($CopDryRun) { Say "would release $n from $($L.by): $why" Yellow; continue }
+            $gone = With-Lock {
+                $cur = Read-Lease $n
+                if (-not $cur -or $cur.by -ne $L.by -or [string]$cur.taken -ne [string]$L.taken -or -not $cur.idleSince) { return $false }
+                Remove-Lease $n; Log-Line "reap $n $($L.by) ($why)"; return $true
+            }
+            if (-not $gone) { continue }
+            $out += @{ lease = $n; by = $L.by; why = $why }
+            if ($ScratchDir) {
+                $d = Join-Path $ScratchDir (([string]$L.by) -replace '\.j\d+$', '')
+                if (Test-Path $d) { try { [IO.File]::AppendAllText((Join-Path $d 'THOR_COP.txt'), "`r`n[THOR COP] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') released your $n lease: $why.`r`n[THOR COP] A lease covers the work, not the session. Take it again when the next step is ready, or renew -EstMin if the step is still going.`r`n", $Utf8) } catch {} }
+            }
             continue
         }
-        $reasons = Quiet-Reasons (Get-Gpu) (Get-Procs) (Get-Leases)
-        if ($reasons.Count) {
-            $since = $null; $ready = $false
-            $msg = $reasons -join '; '
-            if ($res.mine) { [void](Do-Release $Name); Say "your $Name lease is let go while the GPU is noisy; you keep a queue place" Yellow }
-            if ($msg -ne $lastMsg -or ($now - $said).TotalSeconds -ge 60) {
-                Say "waiting for a quiet GPU, $Name left free: $msg" Yellow; $lastMsg = $msg; $said = $now
-                if ($JobId) { [void](Set-Job $JobId @{ waiting = "no quiet GPU: $msg" } @('starting')) }
+        if ($CopDryRun -or $idle -eq [bool]$L.idleSince) { continue }
+        # The mark goes on the lease file, so it survives a cop restart and status can show it. A renew writes a new lease, which clears it.
+        With-Lock {
+            $cur = Read-Lease $n
+            if ($cur -and $cur.by -eq $L.by -and [string]$cur.taken -eq [string]$L.taken) {
+                $cur | Add-Member -NotePropertyName idleSince -NotePropertyValue $(if ($idle) { Iso $now } else { $null }) -Force; Write-Lease $n $cur
             }
-            if (-not $logged) { $logged = $true; Log-Line "park $Name $By waiting for a quiet GPU, $Name left free: $(Short $msg 120)" }
-            if ($park -ne 'quiet') { $park = 'quiet'; continue }
-        } else {
-            if (-not $since) {
-                $since = $now; Say "quiet; settling $SettleSec s"
-                if ($JobId) { [void](Set-Job $JobId @{ waiting = '' } @('starting')) }
-            }
-            if ($park) { $park = ''; continue }
-            if (($now - $since).TotalSeconds -ge $SettleSec) { $ready = $true; continue }
-        }
-        if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 3; msg = "no quiet GPU within $TimeoutMin min; left the $Name queue, nothing started"; why = "no quiet GPU within $TimeoutMin min" } }
-        Start-Sleep -Seconds 2
+        } | Out-Null
     }
+    return , $out
 }
 function Status-Queue([string]$Name, $X) {
     $holder = if ($X.state -eq 'live') { [string]$X.lease.by } else { '' }
@@ -930,6 +1012,7 @@ function Board-Model {
         $cp = Cop-Pass $m.procs $m.leases
         if ($cp.killed.Count) { $script:CopKills += $cp.killed.Count; Start-Sleep -Milliseconds 800; $m.procs = Get-Procs; $m.gpu = Get-Gpu 2 }
     }
+    if ($script:CopOn) { try { if ((Reap-Pass $m.procs $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
     if ($script:CopOn) { try { if (@(Dispatch-Pass).Count) { $m.leases = Get-Leases } } catch {} }
     $m.cov = Coverage $m.procs $m.leases
     $m.reasons = Quiet-Reasons $m.gpu $m.procs $m.leases
@@ -997,7 +1080,7 @@ function Board-Lines($M) {
     Row "RECENT  ($LogFile)" 'White'
     if (-not $M.log.Count) { Row '  (no log yet)' 'DarkGray' }
     foreach ($e in $M.log) {
-        $c = switch -Regex ($e.verb) { '^take|^renew' { 'Cyan' } '^queue' { 'Yellow' } '^dequeue|^lapse|forced|^cop' { 'Red' } default { 'Gray' } }
+        $c = switch -Regex ($e.verb) { '^take|^renew' { 'Cyan' } '^queue' { 'Yellow' } '^dequeue|^lapse|forced|^cop|^reap|^park-long' { 'Red' } default { 'Gray' } }
         Row ("  {0}  {1,-8} {2,-7} {3,-7} {4}" -f $e.t, $e.verb, $e.lease, $e.by, $e.rest) $c
     }
     return , $rows
@@ -1148,7 +1231,7 @@ function Ansi-Rows($M, [int]$Width, [int]$Height) {
     $log = @($M.log | Select-Object -Last $room)
     if (-not $log.Count) { Add @((Seg '  (no lease events yet)' $K.dim)) }
     foreach ($e in $log) {
-        $vc = switch -Regex ($e.verb) { '^take|^renew' { $K.cyan } '^release|^unqueue' { $K.green } '^queue' { $K.amber } '^dequeue|^lapse|forced|^cop' { $K.red } default { $K.txt } }
+        $vc = switch -Regex ($e.verb) { '^take|^renew' { $K.cyan } '^release|^unqueue' { $K.green } '^queue' { $K.amber } '^dequeue|^lapse|forced|^cop|^reap|^park-long' { $K.red } default { $K.txt } }
         Add @((Seg "  $($e.t)  " $K.dim), (Seg ('{0,-11}' -f $e.verb) $vc), (Seg ('{0,-7}' -f $e.lease) $K.txt), (Seg ('{0,-6}' -f $e.by) $K.hi), (Seg "  $($e.rest)" $K.dim))
     }
     Add @((Seg "  q quits  $($Ch.mid)  t alerts on/off  $($Ch.mid)  r re-reads sessions  $($Ch.mid)  $(Show-Path $Dir)  $($Ch.mid)  -Plain for plain text  $($Ch.mid)  COP: $(Cop-Text)" $K.dim))
@@ -1360,7 +1443,7 @@ function Watch-Alerts($M) {
             $ts = $Matches[1]; $vb = $Matches[2]
             if ([string]::CompareOrdinal($ts, $al.logAt) -le 0) { continue }
             $al.logAt = $ts
-            if ($vb -match '^(cop-kill|strike|lapse|dequeue|dispatch|job-|reestimate)' -or $ln -match ' forced') { $ev.Add((Short ("$vb " + ($ln -replace '^\S+ \S+ ', '')) 160)) }
+            if ($vb -match '^(cop-kill|strike|lapse|dequeue|dispatch|job-|reestimate|reap|park-long)' -or $ln -match ' forced') { $ev.Add((Short ("$vb " + ($ln -replace '^\S+ \S+ ', '')) 160)) }
         }
     }
     # runs no lease covers
@@ -1473,7 +1556,11 @@ switch ($Verb) {
         $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin)
         $lastSaid = [DateTime]::MinValue
         while ($true) {
-            $res = Try-Take $Lease $min $HolderPid
+            try { $res = Try-Take $Lease $min $HolderPid }
+            catch {
+                if (-not $Wait -or [DateTime]::UtcNow -ge $deadline) { throw }
+                Say "look failed, trying again: $($_.Exception.Message)" Yellow; Start-Sleep -Seconds 5; continue
+            }
             if ($res.ok) {
                 $what = if ($res.renewed) { 'renewed' } else { 'taken' }
                 Say "$Lease $what by $(Describe-Lease $res.cur)" Green
@@ -1517,7 +1604,10 @@ switch ($Verb) {
         }
         Say "GPU cop on (every $Every s, grace $CopGraceSec s); Ctrl+C stops it" Magenta
         while ($true) {
-            try { $cp = Cop-Pass (Get-Procs) (Get-Leases); foreach ($k in $cp.killed) { Say "stopped pid $($k.pid): $($k.cmd)" Red } } catch { Say "cop pass failed: $($_.Exception.Message)" Yellow }
+            $procs = $null
+            try { $procs = @(Get-Procs); $cp = Cop-Pass $procs (Get-Leases); foreach ($k in $cp.killed) { Say "stopped pid $($k.pid): $($k.cmd)" Red } } catch { Say "cop pass failed: $($_.Exception.Message)" Yellow }
+            # No process list means no judging who is idle.
+            if ($null -ne $procs) { try { foreach ($rp in (Reap-Pass $procs (Get-Leases))) { Say "released $($rp.lease) from $($rp.by): $($rp.why)" Yellow } } catch { Say "reap pass failed: $($_.Exception.Message)" Yellow } }
             try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
             if ($Once) { exit 0 }
             Start-Sleep -Seconds ([Math]::Max(2, $Every))
@@ -1644,10 +1734,13 @@ switch ($Verb) {
             $code = $p.ExitCode
             Say "pid $($p.Id) exited $code"
         } finally {
-            With-Lock {
-                $cur = Read-Lease $Lease
-                if ($cur -and $cur.by -eq $By -and [int]$cur.pid -eq $PID) { Remove-Lease $Lease; Log-Line "release $Lease $By (run done)" }
-            } | Out-Null
+            # The lease is tied to this process, so it ends with it anyway; the job's exit code has only this one chance to land.
+            try {
+                With-Lock {
+                    $cur = Read-Lease $Lease
+                    if ($cur -and $cur.by -eq $By -and [int]$cur.pid -eq $PID) { Remove-Lease $Lease; Log-Line "release $Lease $By (run done)" }
+                } | Out-Null
+            } catch { Say "release failed: $($_.Exception.Message)" Yellow }
             if ($why) { Job-End 'failed' $null $why } else { Job-End $(if ($code -eq 0) { 'done' } else { 'failed' }) $code $(if ($code -ne 0) { "exited $code" } else { '' }) }
         }
         exit $code
@@ -1656,6 +1749,10 @@ switch ($Verb) {
         Need-By
         if (-not $Lease) { $Lease = 'gpu' }
         if (-not $Exe) { Fail 'submit needs -Exe <path> (and -ArgList for its arguments)' }
+        if ($Quiet -and $NoQuiet) { Fail 'pick one: -Quiet (a timing run) or -NoQuiet' }
+        # Quiet on the gpu lease is for timed work, so a gpu job asks for it: -Quiet, or one of quiet's switches. A job on another
+        # lease keeps the wait: it's what keeps a build job off an open editor.
+        if ($Lease -eq 'gpu' -and -not @($script:BoundKeys | Where-Object { $_ -in @('Quiet', 'AllowEditor', 'AllowBuild', 'MaxVramGB', 'MaxUtil', 'SettleSec') }).Count) { $NoQuiet = $true }
         Do-Submit
     }
     'job' {
