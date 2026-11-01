@@ -24,7 +24,7 @@ One PowerShell file. No server, no service account, no database: state is a fold
 | | |
 |---|---|
 | 🔒 **Leases** | `editor`, `gpu`, `build`. Advisory, file-backed, with an expiry and an estimate. Tie one to a process and it ends when the process dies — a crashed agent never strands the GPU. |
-| 🧾 **A fair queue** | A take that finds the lease held joins its waitlist and gets told its place, its expected start, and when to check back. A freed lease is *kept* for the first in line — no barging. |
+| 🧾 **A fair queue** | A take that finds the lease held joins its waitlist and gets told its place, its expected start, and when to check back. A freed lease is *kept* for the first in line who can use it now — no barging past anyone ready, and nobody blocked by a waiter who isn't. |
 | 🚀 **A dispatcher** | `submit` queues the *launch command itself*. When the lease frees, Thor starts it — no polling, no dead air between jobs. Exit code and stdout/stderr are kept for the agent to read later. |
 | ⏱️ **Re-estimates** | Running long? `renew -EstMin <minutes left>` moves your estimate, and everyone queued behind you gets the new time. |
 | 🤫 **Quiet-GPU gate** | Timed runs (fps, load times, frame costs) wait until the card is actually idle: no other lease, VRAM and load under a threshold, no editor, no shader compiles, no local LLM. They wait from the queue holding nothing, so a noisy card never blocks work that doesn't need it quiet. |
@@ -61,6 +61,7 @@ Want to see the board without touching your machine? It ships with a replayable 
 
 Every message is written for an agent to act on: what's held, by whom, until when, your place in line, exactly when to
 come back. Exit codes are machine-readable (`0` ok, `2` held — you're queued, `3` GPU not quiet) and every read verb has `-Json`.
+A job that's waiting says on what: `job` prints `[waits: ...]`, and `job -Json` has it in `waiting`.
 
 ## How it works
 
@@ -71,8 +72,9 @@ flowchart LR
     A3[Agent C] -- submit gpu --> Q
     L -- release / process exits --> D[dispatcher]
     Q --> D
-    D -- first in line is a job --> R["runner: waits for a quiet GPU holding nothing, takes the lease, starts the command"]
-    D -- first in line is a waiter --> K["kept for them until check-back"]
+    D -- first ready in line is a job --> R["runner: waits for a quiet GPU holding nothing, takes the lease, starts the command"]
+    D -- first ready in line is a waiter --> K["kept for them until check-back"]
+    R -. noisy card so it stands aside .-> Q
     R -- "exit code + logs" --> J[("jobs/id.json")]
     C[cop] -. every 5 s .-> P[processes]
     C -. uncovered -game run .-> X["stop + note in its -abslog"]
@@ -102,6 +104,14 @@ flowchart LR
 | `editor` | having the Unreal editor open, PIE | 120 min |
 | `build` | C++ builds (UBT/UAT), cooks | 60 min |
 
+Two rules keep the queue honest:
+
+- **A lease covers the work, not the session.** Release it the moment that step ends, before you wait on anything else
+  (another lease, a job, a build, a human), and take it again when the next step is ready. Don't renew through idle time.
+- **A launcher handed to `run` or `submit` must wait for everything it starts.** The lease ends when the launcher exits, so
+  anything still running is uncovered, and the cop stops an agent's uncovered game. In a `.cmd`, `start "" /wait` a program
+  rather than leaving it in the background.
+
 Agent markers the cop understands out of the box: `-ExecCmds=`, `-abslog=`, `-log=`, `-ResX=`, `bRemoteExecution=False`,
 or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the process tree. Add yours with `$env:THOR_AGENT_MARKERS`.
 
@@ -112,7 +122,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `status [-Json]` | Leases, queues with expected starts, what's running, quiet-GPU verdict. |
 | `take <lease> -By <who> [-For] [-EstMin] [-Minutes] [-HolderPid] [-Wait] [-NoQueue]` | Take a lease or join its queue (exit 2). `-Wait` blocks in the queue. |
 | `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times. Never shortens. |
-| `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line. `-Force` only for a holder that's gone. |
+| `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line who can use it. `-Force` only for a holder that's gone. |
 | `unqueue <lease> -By <who>` | Leave a queue. |
 | `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. Takes `quiet`'s switches too, and the job keeps them. |
 | `job [-JobId <id>] [-By <who>] [-Json] [-Cancel]` | A job's state, exit code and output tail, or the job list. `-Cancel` kills the tree. |
@@ -121,6 +131,19 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20] [-AllowEditor] [-AllowBuild]` | Is the GPU quiet? Exit 3 if not. `run`, `hold` and `submit` take the same switches. |
 | `watch [-Every 5] [-NoCop] [-NoToast] [-Plain] [-Frame -Cols -Rows] [-Fixture]` | The live board (and the cop). `-Frame` prints one frame and exits. |
 | `cop [-Once] [-CopDryRun] [-CopLenient] [-CopWait]` | The enforcer + dispatcher without the board. |
+
+### Job states
+
+| state | means |
+|---|---|
+| `queued` | In the queue, no runner yet. |
+| `starting` | Its runner is up. It may be waiting for a quiet GPU, holding nothing; `waiting` says why. |
+| `running` | It holds the lease and its command is running. |
+| `done` | The command exited 0. |
+| `failed` | The command exited non-zero, it never got quiet or the lease within `-TimeoutMin`, or it couldn't start. `why` says which. |
+| `cancelled` | `job -Cancel`. Its whole process tree goes with it. |
+| `expired` | It left the queue unstarted, past `-TimeoutMin` or unqueued. |
+| `lost` | Its runner died without reporting: killed, or the box restarted. |
 
 ## Configuration
 
@@ -147,7 +170,9 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 pwsh .\tests\run-tests.ps1     # 89 end-to-end checks in a throwaway state folder, about 4 min; no GPU needed
 ```
 
-CI runs the same suite on `windows-latest`.
+CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the
+process list in a copy of `thor.ps1` so it can move the card from noisy to quiet under a waiter that's already running.
+Run that one alone with `-Shell powershell` to check it under Windows PowerShell 5.1.
 
 ---
 

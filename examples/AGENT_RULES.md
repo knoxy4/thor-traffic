@@ -11,12 +11,15 @@ THOR TRAFFIC - this workstation is shared by several agents and a human. Leases 
   a C++ build or cook = build.
 - Hold it honestly: <thor> take <lease> -By <you> -For '<what>' -EstMin <minutes>; release it when done
   (<thor> release <lease> -By <you>). Your estimate is everyone else's wait time - don't lowball it.
+- A lease covers the work, not the session: release it the moment that step ends, before you wait on anything else,
+  and take it again when the next step is ready. Don't renew it through idle time.
 - Running long: <thor> renew <lease> -By <you> -EstMin <minutes still needed>. The queue's times move with it.
 - Held (exit 2) = you're queued. Don't spin. Prefer fire-and-forget:
   <thor> submit <lease> -By <you> -Exe <exe> -ArgList '<args>' -For '<what>' -EstMin <n> [-WorkDir <dir>]
   Thor starts it the moment the lease is yours (after a quiet GPU unless -NoQuiet; the wait holds nothing and blocks
   nobody, but use -NoQuiet for anything not timed, or it starts late). Read it back later:
-  <thor> job -JobId <id> -Json   (state, exit code, stdout/stderr log paths)
+  <thor> job -JobId <id> -Json   (state, exit code, stdout/stderr log paths; "waiting" says what a starting job waits on)
+  A launcher you hand to run or submit must wait for everything it starts: the lease ends when the launcher exits.
   Waiting by hand instead: run the same take again at the check-back time it gives you, or you drop out.
 - Timed work (fps, load times, frame costs) waits for a quiet GPU: <thor> run -By <you> -Exe ... or
   & <thor> hold gpu -By <you> inside a script that launches its own processes.

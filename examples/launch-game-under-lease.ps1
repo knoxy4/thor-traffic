@@ -8,7 +8,7 @@ param(
     [int]$EstMin = 15
 )
 $ErrorActionPreference = 'Stop'
-# In-process (&): waits in the queue, then for a quiet GPU, then holds the lease tied to this PowerShell process.
+# In-process (&): waits in the queue and for a quiet GPU, holding nothing, then takes the lease tied to this PowerShell process.
 & $Thor hold gpu -By $By -For 'fps capture' -EstMin $EstMin -TimeoutMin 60
 if ($LASTEXITCODE) { throw "no gpu lease (exit $LASTEXITCODE)" }
 try {

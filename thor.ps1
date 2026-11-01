@@ -28,6 +28,9 @@
 # or run / hold / submit) also ends when that process exits, so a killed run frees it. -EstMin is how long you expect to
 # hold it: everyone else's wait times are built from it. Running long: renew -EstMin <minutes still needed> moves the
 # estimate (and the expiry covers it); a plain renew keeps the estimate as it stands and never shortens an expiry.
+# A lease covers the work, not the session: release it the moment that step ends, before you wait on anything else, and
+# take it again when the next step is ready. A launcher handed to run or submit must wait for everything it starts, because
+# the lease ends when the launcher exits.
 #
 # Waitlist. A take that finds the lease held joins its queue and is told its place, its expected start and when to check
 # back (never more than 10 min out, so an early release is noticed). Taking again at that time keeps the place; not back
@@ -45,8 +48,9 @@
 # from a watch window, or from the submit itself when the lease is free now - as `run -JobId <id>` in a detached, windowless
 # process: wait for a quiet GPU (unless -NoQuiet, with the job's own -AllowEditor, -AllowBuild, -MaxVramGB, -MaxUtil and
 # -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
-# stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting, running, done, failed,
-# cancelled, expired (never started within -TimeoutMin), lost (runner killed). Read a job back with job -JobId <id> -Json.
+# stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting (its runner is up, and may
+# be waiting for quiet: the waiting field says why), running, done, failed, cancelled, expired (never started within
+# -TimeoutMin), lost (runner killed). Read a job back with job -JobId <id> -Json.
 #
 # Quiet GPU. For anything timed: no other holder's gpu lease, under -MaxVramGB of video memory in use, the GPU under
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
