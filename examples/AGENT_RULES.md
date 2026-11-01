@@ -14,7 +14,8 @@ THOR TRAFFIC - this workstation is shared by several agents and a human. Leases 
 - Running long: <thor> renew <lease> -By <you> -EstMin <minutes still needed>. The queue's times move with it.
 - Held (exit 2) = you're queued. Don't spin. Prefer fire-and-forget:
   <thor> submit <lease> -By <you> -Exe <exe> -ArgList '<args>' -For '<what>' -EstMin <n> [-WorkDir <dir>]
-  Thor starts it the moment the lease is yours (after a quiet GPU unless -NoQuiet). Read it back later:
+  Thor starts it the moment the lease is yours (after a quiet GPU unless -NoQuiet; the wait holds nothing and blocks
+  nobody, but use -NoQuiet for anything not timed, or it starts late). Read it back later:
   <thor> job -JobId <id> -Json   (state, exit code, stdout/stderr log paths)
   Waiting by hand instead: run the same take again at the check-back time it gives you, or you drop out.
 - Timed work (fps, load times, frame costs) waits for a quiet GPU: <thor> run -By <you> -Exe ... or

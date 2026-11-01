@@ -1,5 +1,5 @@
-# run-tests.ps1 - end-to-end tests for thor.ps1 in a throwaway state dir. Needs no GPU: jobs run with -NoQuiet and the
-# board is rendered from demo\fixture.json. Usage: pwsh tests\run-tests.ps1 [-Keep]
+# run-tests.ps1 - end-to-end tests for thor.ps1 in a throwaway state dir. Needs no GPU: jobs run with -NoQuiet, the board is
+# rendered from demo\fixture.json, and quiet-wait-tests.ps1 stubs the GPU. Usage: pwsh tests\run-tests.ps1 [-Keep]
 param([switch]$Keep)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -80,6 +80,12 @@ try {
     Check 'board frame renders' ($plain -match 'THOR TRAFFIC' -and $plain -match 'NEXT 90 MIN')
     Check 'board tags the uncovered run NO LEASE' ($plain -match 'NO LEASE')
     Check 'board shows the queued job as AUTO' ($plain -match 'AUTO: starts itself')
+    # --- waiting for a quiet GPU holds nothing (its own script: it stubs the GPU in a copy of thor.ps1)
+    $qp = 0; $qf = 0
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'quiet-wait-tests.ps1') | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
+    $qx = $LASTEXITCODE
+    $pass += $qp; $fail += $qf
+    if ($qx -and -not $qf) { $script:out = 'quiet-wait-tests.ps1 stopped before its end'; Check 'quiet-wait suite ran to its end' $false }
 } finally {
     if (-not $Keep) { Start-Sleep -Seconds 1; Remove-Item $D, "$D-demo" -Recurse -Force -ErrorAction SilentlyContinue }
 }

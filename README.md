@@ -27,7 +27,7 @@ One PowerShell file. No server, no service account, no database: state is a fold
 | 🧾 **A fair queue** | A take that finds the lease held joins its waitlist and gets told its place, its expected start, and when to check back. A freed lease is *kept* for the first in line — no barging. |
 | 🚀 **A dispatcher** | `submit` queues the *launch command itself*. When the lease frees, Thor starts it — no polling, no dead air between jobs. Exit code and stdout/stderr are kept for the agent to read later. |
 | ⏱️ **Re-estimates** | Running long? `renew -EstMin <minutes left>` moves your estimate, and everyone queued behind you gets the new time. |
-| 🤫 **Quiet-GPU gate** | Timed runs (fps, load times, frame costs) wait until the card is actually idle: no other lease, VRAM and load under a threshold, no editor, no shader compiles, no local LLM. |
+| 🤫 **Quiet-GPU gate** | Timed runs (fps, load times, frame costs) wait until the card is actually idle: no other lease, VRAM and load under a threshold, no editor, no shader compiles, no local LLM. They wait from the queue holding nothing, so a noisy card never blocks work that doesn't need it quiet. |
 | 👮 **The cop** | Stops agent `-game`/packaged runs the gpu lease doesn't cover (after a 45 s grace) and tells the agent why in its own log. C++ builds without the build lease are logged as strikes, never killed. Your own launches are never touched. |
 | 📺 **The board** | Live, colour terminal view with a 90-minute timeline, strikes, and Windows toast alerts when leases change hands, jobs finish or the GPU goes quiet. |
 
@@ -71,7 +71,7 @@ flowchart LR
     A3[Agent C] -- submit gpu --> Q
     L -- release / process exits --> D[dispatcher]
     Q --> D
-    D -- first in line is a job --> R["runner: waits for a quiet GPU, holds the lease, starts the command"]
+    D -- first in line is a job --> R["runner: waits for a quiet GPU holding nothing, takes the lease, starts the command"]
     D -- first in line is a waiter --> K["kept for them until check-back"]
     R -- "exit code + logs" --> J[("jobs/id.json")]
     C[cop] -. every 5 s .-> P[processes]
@@ -88,6 +88,11 @@ flowchart LR
   as covered. One launcher can hold `build` + `gpu` at once.
 - **Jobs run detached** (WMI-created, headless console, no inherited handles), so `submit` returns immediately even when
   the job starts on the spot, and a cancelled job takes its whole process tree with it.
+- **A wait for quiet holds nothing.** `run`, `hold` and jobs wait from the queue and take the lease after the settle, so its
+  estimate starts with the work. While the card is noisy the waiter stands aside: it keeps its place, but the lease isn't
+  kept for it, and a plain `take` or a `-NoQuiet` job can go past. Once quiet it takes its place back and the lease is kept
+  for it through the settle. So a stream of `-NoQuiet` work can delay a timed run while the card stays noisy, up to its
+  timeout. `status`, the board and `job` all show who's standing aside and why.
 
 ## Leases at a glance
 
@@ -109,11 +114,11 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times. Never shortens. |
 | `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line. `-Force` only for a holder that's gone. |
 | `unqueue <lease> -By <who>` | Leave a queue. |
-| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. |
+| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. Takes `quiet`'s switches too, and the job keeps them. |
 | `job [-JobId <id>] [-By <who>] [-Json] [-Cancel]` | A job's state, exit code and output tail, or the job list. `-Cancel` kills the tree. |
-| `run -By <who> -Exe <path> [-ArgList] [-Lease gpu] [-NoQuiet]` | Wait in line, wait for quiet, run, release, return the exit code. |
-| `& hold [lease] -By <who>` | For launcher scripts: take the lease tied to the calling process. |
-| `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20]` | Is the GPU quiet? Exit 3 if not. |
+| `run -By <who> -Exe <path> [-ArgList] [-Lease gpu] [-NoQuiet]` | Wait in line, wait for quiet, take the lease, run, release, return the exit code. Waits for quiet on any lease unless `-NoQuiet`. |
+| `& hold [lease] -By <who> [-NoQuiet]` | For launcher scripts: take the lease tied to the calling process. Waits for quiet on `gpu` only. |
+| `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20] [-AllowEditor] [-AllowBuild]` | Is the GPU quiet? Exit 3 if not. `run`, `hold` and `submit` take the same switches. |
 | `watch [-Every 5] [-NoCop] [-NoToast] [-Plain] [-Frame -Cols -Rows] [-Fixture]` | The live board (and the cop). `-Frame` prints one frame and exits. |
 | `cop [-Once] [-CopDryRun] [-CopLenient] [-CopWait]` | The enforcer + dispatcher without the board. |
 
@@ -131,13 +136,15 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 - **Advisory.** Leases only hold if every agent takes them. The cop enforces the GPU rule for `-game`/packaged runs; the
   rest relies on your agents following the rules block (they do, if it's in their prompt).
 - **Windows + PowerShell 7**, NVIDIA for the GPU gate (`nvidia-smi`). Without it the gate reports "no reading" and timed runs wait.
+- **A build job's only guard against an open editor is the quiet wait.** With an editor open, `submit build` waits; `-NoQuiet`
+  skips that, and the link can then fail on a DLL the editor has loaded.
 - **VRAM is a card total** — Windows (WDDM) doesn't report video memory per process.
 - **One user.** Agents and the human run as the same Windows user; the state folder isn't an ACL boundary.
 
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 26 end-to-end checks in a throwaway state folder; no GPU needed
+pwsh .\tests\run-tests.ps1     # 89 end-to-end checks in a throwaway state folder, about 4 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`.

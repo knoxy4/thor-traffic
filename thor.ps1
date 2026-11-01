@@ -12,10 +12,10 @@
 #   thor.ps1 release <lease> -By <who> [-Force]
 #   thor.ps1 unqueue <lease> -By <who>
 #   thor.ps1 submit  [gpu|editor|build] -By <who> -Exe <path> [-ArgList '<args>'] [-WorkDir <dir>] [-For 'what'] [-EstMin 20]
-#                    [-NoQuiet] [-TimeoutMin 240] [-Json]
+#                    [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
 #   thor.ps1 job     [-JobId <id>] [-By <who>] [-Json] [-Cancel]
-#   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60]
-#   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30]
+#   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
+#   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
 #   thor.ps1 quiet   [-By <who>] [-Wait] [-TimeoutMin 30] [-SettleSec 20] [-MaxVramGB 3.5] [-MaxUtil 50] [-AllowEditor] [-AllowBuild]
 #   thor.ps1 watch   [-Every 5] [-NoCop] [-Plain] [-Once] [-NoToast] [-Frame -Cols 150 -Rows 50] [-Fixture <demo.json>]
 #   thor.ps1 cop     [-Every 5] [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>]
@@ -33,10 +33,18 @@
 # back (never more than 10 min out, so an early release is noticed). Taking again at that time keeps the place; not back
 # within 5 min of it drops you. When a lease frees it is kept for the first in line until they check back.
 #
+# Standing aside. Only a wait for the lease itself reserves the lease. run, hold and jobs wait for quiet from the queue and
+# take the lease after -SettleSec, so its estimate starts with the work. While the GPU is noisy the waiter is parked: it
+# keeps its place, but the lease isn't kept for it and whoever can use it now takes it (a plain take, a -NoQuiet job). Once
+# quiet it unparks, reclaims its place and the lease is kept for it through the settle. A queued job behind one parked for
+# quiet with the same quiet switches waits unstarted, because it would only wait too. A holder that calls run or hold lets
+# its own lease go while the GPU is noisy.
+#
 # Dispatcher. submit puts a launch command in the queue as a job (jobs\<id>.json) under its own name <who>.j<n>. It needs
-# no check-back: whenever a lease is unheld and its queue's first entry is a job, the dispatcher starts it - from the cop,
+# no check-back: whenever a lease is unheld and its queue's first ready entry is a job, the dispatcher starts it - from the cop,
 # from a watch window, or from the submit itself when the lease is free now - as `run -JobId <id>` in a detached, windowless
-# process: wait for a quiet GPU (unless -NoQuiet), hold the lease tied to that runner, start -Exe in -WorkDir with stdout and
+# process: wait for a quiet GPU (unless -NoQuiet, with the job's own -AllowEditor, -AllowBuild, -MaxVramGB, -MaxUtil and
+# -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
 # stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting, running, done, failed,
 # cancelled, expired (never started within -TimeoutMin), lost (runner killed). Read a job back with job -JobId <id> -Json.
 #
@@ -44,7 +52,8 @@
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
 # editor (-AllowEditor ignores it) and no UBT / UAT / shader-compile / cargo work (-AllowBuild ignores it). quiet -Wait,
 # run, hold and dispatched jobs need it to hold for -SettleSec in a row. Windows doesn't report VRAM per process, so the
-# card total gates.
+# card total gates. run and jobs wait for it on any lease unless -NoQuiet: with an editor open, that is what keeps a build
+# job from failing at the link. hold waits for it on gpu only.
 #
 # The cop (inside watch unless -NoCop, or alone as `cop`; install-cop.ps1 runs it at logon; one cop at a time):
 #   - stops agent -game and packaged runs that the gpu lease doesn't cover, once they are -CopGraceSec old (45 s). Never
@@ -236,6 +245,17 @@ function Live-Queue([string]$Name, [string]$HolderBy, [switch]$Log) {
     }
     return , $keep
 }
+function Queue-First($Q) {
+    # Who a free lease is kept for: the first waiter that could use it now (header: Standing aside).
+    $quietAhead = @()
+    foreach ($e in @($Q)) {
+        if ($e.parked) { $quietAhead += [string]$e.quietKey; continue }
+        if ($e.needQuiet -and $quietAhead -contains [string]$e.quietKey) { continue }
+        return $e
+    }
+    return $null
+}
+function Quiet-Key { return "$([bool]$AllowEditor)|$([bool]$AllowBuild)|$MaxVramGB|$MaxUtil" }
 function Free-At($L, [string]$State) {
     # When the current holder should be done: its estimate, capped at its expiry; past the estimate, OverrunMin more.
     $now = [DateTime]::UtcNow
@@ -268,7 +288,8 @@ function Wait-Text($Res, [string]$Name) {
     else { $s += ' Not queued (-NoQueue).' }
     return $s
 }
-function Try-Take([string]$Name, [int]$Min, [int]$TiePid) {
+function Try-Take([string]$Name, [int]$Min, [int]$TiePid, [bool]$Ready = $true, [bool]$NeedQuiet = $false, [string]$Park = '') {
+    # -Ready $false does everything but the take: it keeps the caller's queue place and says if the lease is theirs to take (turn).
     With-Lock {
         $cur = Read-Lease $Name
         $state = Lease-State $cur
@@ -276,10 +297,11 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid) {
         $q = Live-Queue $Name $holder -Log
         $now = [DateTime]::UtcNow
         $est = Est-Minutes $Name
-        $head = if ($q.Count) { $q[0] } else { $null }
+        $first = Queue-First $q
         $mine = $holder -eq $By
-        $free = -not $holder -and (-not $head -or $head.by -eq $By)
-        if ($mine -or $free) {
+        $free = -not $holder -and (-not $first -or $first.by -eq $By)
+        if ($mine -and -not $Ready) { return @{ ok = $false; turn = $true; mine = $true; cur = $cur } }
+        if (($mine -or $free) -and $Ready) {
             if ($cur -and $state -ne 'live') { Log-Line "lapse $Name $($cur.by) ($state)" }
             $taken = Now-Iso
             if ($mine) { $taken = Iso (To-Utc $cur.taken) }
@@ -309,13 +331,14 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid) {
             if ($mine -and $oldEta -and [Math]::Abs(($etaT - $oldEta).TotalMinutes) -ge 1) { Log-Line "reestimate $Name $By done ~$($new.eta) (was $(Iso $oldEta))$(if ($q.Count) { "; $($q.Count) waiting" })" }
             return @{ ok = $true; cur = [pscustomobject]$new; renewed = $mine; oldEta = $oldEta; waiting = $q.Count }
         }
-        # Held, or free but kept for the queue's first: join (or refresh) the queue and say when to come back.
+        # Held, free but kept for the queue's first, or ours but not ready for it: join (or refresh) the queue and say when to come back.
         $old = $q | Where-Object { $_.by -eq $By } | Select-Object -First 1
         $joined = if ($old) { IsoFine (To-Utc $old.joined) } else { IsoFine $now }
         $me = [ordered]@{
             by = $By; note = $For; est = $est; joined = $joined
-            nextCheck = $null; until = $null; pid = $null; pidStart = $null
+            nextCheck = $null; until = $null; pid = $null; pidStart = $null; needQuiet = $NeedQuiet; parked = $Park; quietKey = (Quiet-Key)
         }
+        if ($old -and $old.job) { $me.job = [string]$old.job }
         if ($TiePid) { $me.pid = $TiePid; $me.pidStart = Pid-Stamp $TiePid }
         $list = @(@($q | Where-Object { $_.by -ne $By }) + @([pscustomobject]$me) | Sort-Object { (To-Utc $_.joined).Ticks }, { [string]$_.by })
         $plan = Plan-Queue $list (Free-At $cur $state)
@@ -323,10 +346,13 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid) {
         $start = $plan[$i].start
         $check = Check-Back $start
         $until = $check.AddMinutes($GraceMin)
-        $res = @{ ok = $false; cur = $cur; pos = $i + 1; total = $list.Count; start = $start; check = $check; until = $until
+        # A parked waiter's turn doesn't end because someone behind it is next: once the GPU is quiet it reclaims its place.
+        $turn = $free
+        if (-not $turn -and -not $holder -and $old) { $names = @($q | ForEach-Object { [string]$_.by }); $turn = [array]::IndexOf($names, [string]$first.by) -gt [array]::IndexOf($names, $By) }
+        $res = @{ ok = $false; turn = $turn; cur = $cur; pos = $i + 1; total = $list.Count; start = $start; check = $check; until = $until
             ahead = @($list[0..([Math]::Max(0, $i - 1))] | Where-Object { $_.by -ne $By } | ForEach-Object { $_.by }); queued = -not $NoQueue }
         if ($i -eq 0) { $res.ahead = @() }
-        if (-not $holder -and $head) { $res.reservedFor = $head.by; $res.reservedUntil = To-Utc $head.until }
+        if (-not $holder -and $first -and $first.by -ne $By) { $res.reservedFor = $first.by; $res.reservedUntil = To-Utc $first.until }
         if ($NoQueue) { return $res }
         $me.nextCheck = Iso $check; $me.until = Iso $until
         $list = @($list | ForEach-Object { if ($_.by -eq $By) { [pscustomobject]$me } else { $_ } })
@@ -356,7 +382,8 @@ function Do-Release([string]$Name, [switch]$Quiet) {
         Log-Line "$how $Name $By"
         $q = Live-Queue $Name ''
         $msg = "$Name released (was $($cur.by))"
-        if ($q.Count) { $msg += "; kept for $($q[0].by), first in its queue (checks back by $(Local-Hm $q[0].nextCheck))" }
+        $first = Queue-First $q
+        if ($first) { $msg += "; kept for $($first.by), first in its queue (checks back by $(Local-Hm $first.nextCheck))" }
         return @{ ok = $true; msg = $msg }
     }
 }
@@ -415,12 +442,13 @@ function Do-Submit {
         $job = [pscustomobject][ordered]@{
             id = $id; by = $By; runBy = $runBy; lease = $Lease; note = $For; est = $est
             exe = $exePath; args = $ArgList; cwd = $cwd; noQuiet = [bool]$NoQuiet; timeoutMin = $tmo
+            allowEditor = [bool]$AllowEditor; allowBuild = [bool]$AllowBuild; maxVramGB = $MaxVramGB; maxUtil = $MaxUtil; settleSec = $SettleSec
             state = 'queued'; why = ''; submitted = Iso $now; started = $null; ended = $null; exit = $null; runPid = $null; childPid = $null
             log = (Join-Path $JobDir "$id.log"); out = (Join-Path $JobDir "$id.out.log"); err = (Join-Path $JobDir "$id.err.log")
         }
         Write-Job $job
         # Its queue place never needs a check-back: the dispatcher starts it. It drops out only after -TimeoutMin of waiting.
-        $me = [pscustomobject][ordered]@{ by = $runBy; note = $For; est = $est; joined = IsoFine $now; nextCheck = Iso $now.AddMinutes($tmo); until = Iso $now.AddMinutes($tmo); pid = $null; pidStart = $null; job = $id }
+        $me = [pscustomobject][ordered]@{ by = $runBy; note = $For; est = $est; joined = IsoFine $now; nextCheck = Iso $now.AddMinutes($tmo); until = Iso $now.AddMinutes($tmo); pid = $null; pidStart = $null; job = $id; needQuiet = -not [bool]$NoQuiet; parked = ''; quietKey = (Quiet-Key) }
         $list = @(@($q) + @($me))
         Write-Queue $Lease $list
         $plan = Plan-Queue $list (Free-At $cur $state)
@@ -432,16 +460,16 @@ function Do-Submit {
     $j = Read-Job $res.id
     if ($Json) { $j | ConvertTo-Json -Depth 4; exit 0 }
     if ($j.state -eq 'queued') {
-        $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free but kept for the queue' }
+        $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
         Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
     } else { Say "job $($res.id): $Lease was free; $($j.state) now" Green }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
 function Dispatch-Pass {
-    # Starts a lease's first waiter when it is a submitted job and nobody holds the lease (free, kept for that job). Safe to call
-    # from any process: queued -> starting flips under the lease mutex, so a job starts once. Also settles jobs whose runner died
-    # and queued jobs that fell out of the queue. The runner is `run -JobId` (waits for a quiet GPU, holds the lease tied to
+    # Starts a lease's first ready waiter when it is a submitted job and nobody holds the lease (free, kept for that job). Safe to
+    # call from any process: queued -> starting flips under the lease mutex, so a job starts once. Also settles jobs whose runner
+    # died and queued jobs that fell out of the queue. The runner is `run -JobId` (waits for a quiet GPU, takes the lease tied to
     # itself, starts the command, releases, records the exit code).
     if (-not (Test-Path $JobDir)) { return @() }
     $begun = @()
@@ -450,8 +478,9 @@ function Dispatch-Pass {
             $cur = Read-Lease $nm
             if ((Lease-State $cur) -eq 'live') { return $null }
             $q = Live-Queue $nm ''
-            if (-not $q.Count -or -not $q[0].job) { return $null }
-            $j = Read-Job ([string]$q[0].job)
+            $first = Queue-First $q
+            if (-not $first -or -not $first.job) { return $null }
+            $j = Read-Job ([string]$first.job)
             if (-not $j -or [string]$j.state -ne 'queued') { return $null }
             $j.state = 'starting'; $j.started = Now-Iso; Write-Job $j
             Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($j.note) { " for: $($j.note)" })"
@@ -512,7 +541,8 @@ function Stop-Tree([int]$Root) {
 function Job-Line($J) {
     $t = { param($v) if ($v) { Local-Hm $v } else { '--:--' } }
     $ex = if ($null -ne $J.exit) { " exit $($J.exit)" } else { '' }
-    return ('{0,-26} {1,-9} {2,-6} sub {3}  start {4}  end {5}{6}  {7}' -f $J.id, $J.state, $J.lease, (& $t $J.submitted), (& $t $J.started), (& $t $J.ended), $ex, (Short ([string]$J.note) 60))
+    $wt = if ([string]$J.state -eq 'starting' -and $J.waiting) { "  [waits: $(Short ([string]$J.waiting) 70)]" } else { '' }
+    return ('{0,-26} {1,-9} {2,-6} sub {3}  start {4}  end {5}{6}  {7}{8}' -f $J.id, $J.state, $J.lease, (& $t $J.submitted), (& $t $J.started), (& $t $J.ended), $ex, (Short ([string]$J.note) 60), $wt)
 }
 # ---- the box ------------------------------------------------------------------------------------------------------------
 function Read-Fixture {
@@ -630,11 +660,53 @@ function Wait-Quiet([DateTime]$Deadline) {
         Start-Sleep -Seconds 2
     }
 }
+function Wait-Lease([string]$Name, [int]$Min, [int]$TiePid, [DateTime]$Deadline, [bool]$NeedQuiet) {
+    # run's and hold's wait: in the queue until the lease is ours to take; then, if asked, until the GPU has been quiet for
+    # SettleSec; only then the take (header: Standing aside). Returns the take, or @{ ok = $false; code; msg; why } at the deadline.
+    $ready = -not $NeedQuiet; $park = ''; $since = $null; $said = [DateTime]::MinValue; $lastMsg = ''; $logged = $false
+    while ($true) {
+        if ($JobId) {
+            $jn = With-Lock { Read-Job $JobId }
+            if ($jn -and [string]$jn.state -ne 'starting') { [void](Do-Unqueue $Name); return @{ ok = $false; code = 1; msg = "job $JobId is $($jn.state): nothing started"; why = '' } }
+        }
+        $res = Try-Take $Name $Min $TiePid -Ready $ready -NeedQuiet $NeedQuiet -Park $park
+        if ($res.ok) { return $res }
+        $now = [DateTime]::UtcNow
+        if (-not $res.turn) {
+            $since = $null; $ready = -not $NeedQuiet
+            if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 2; msg = "gave up after $TimeoutMin min and left the queue; $(Wait-Text $res $Name)"; why = "gave up waiting for $Name after $TimeoutMin min" } }
+            if (($now - $said).TotalSeconds -ge 60) { Say "waiting: $(Wait-Text $res $Name)" Yellow; $said = $now }
+            Start-Sleep -Seconds 5
+            continue
+        }
+        $reasons = Quiet-Reasons (Get-Gpu) (Get-Procs) (Get-Leases)
+        if ($reasons.Count) {
+            $since = $null; $ready = $false
+            $msg = $reasons -join '; '
+            if ($res.mine) { [void](Do-Release $Name); Say "your $Name lease is let go while the GPU is noisy; you keep a queue place" Yellow }
+            if ($msg -ne $lastMsg -or ($now - $said).TotalSeconds -ge 60) {
+                Say "waiting for a quiet GPU, $Name left free: $msg" Yellow; $lastMsg = $msg; $said = $now
+                if ($JobId) { [void](Set-Job $JobId @{ waiting = "no quiet GPU: $msg" } @('starting')) }
+            }
+            if (-not $logged) { $logged = $true; Log-Line "park $Name $By waiting for a quiet GPU, $Name left free: $(Short $msg 120)" }
+            if ($park -ne 'quiet') { $park = 'quiet'; continue }
+        } else {
+            if (-not $since) {
+                $since = $now; Say "quiet; settling $SettleSec s"
+                if ($JobId) { [void](Set-Job $JobId @{ waiting = '' } @('starting')) }
+            }
+            if ($park) { $park = ''; continue }
+            if (($now - $since).TotalSeconds -ge $SettleSec) { $ready = $true; continue }
+        }
+        if ($now -ge $Deadline) { [void](Do-Unqueue $Name); return @{ ok = $false; code = 3; msg = "no quiet GPU within $TimeoutMin min; left the $Name queue, nothing started"; why = "no quiet GPU within $TimeoutMin min" } }
+        Start-Sleep -Seconds 2
+    }
+}
 function Status-Queue([string]$Name, $X) {
     $holder = if ($X.state -eq 'live') { [string]$X.lease.by } else { '' }
     $q = Live-Queue $Name $holder
     $plan = Plan-Queue $q (Free-At $X.lease $X.state)
-    return @($plan | ForEach-Object { [pscustomobject]@{ by = $_.e.by; note = $_.e.note; est = $_.e.est; joined = $_.e.joined; start = Iso $_.start; nextCheck = $_.e.nextCheck; until = $_.e.until; job = $_.e.job } })
+    return @($plan | ForEach-Object { [pscustomobject]@{ by = $_.e.by; note = $_.e.note; est = $_.e.est; joined = $_.e.joined; start = Iso $_.start; nextCheck = $_.e.nextCheck; until = $_.e.until; job = $_.e.job; needQuiet = $_.e.needQuiet; parked = $_.e.parked; quietKey = $_.e.quietKey } })
 }
 # ---- watch: the live board ---------------------------------------------------------------------------------------------
 function Lease-Of([int]$P, $LeasePids) {
@@ -893,14 +965,15 @@ function Board-Lines($M) {
             if ($L.pid) { $bits += "tied to pid $($L.pid)" }
             Row ('        ' + ($bits -join '  |  ')) $c
         } else {
-            $kept = if ($q.Count) { "  - kept for $($q[0].by), first in line, until $(Local-Hm $q[0].until)" } else { '' }
+            $first = Queue-First $q
+            $kept = if ($first) { "  - kept for $($first.by), first in line, until $(Local-Hm $first.until)" } else { '' }
             $tail = if ($x.state -ne 'none') { "  ($($L.by)'s lease $($x.state))" } else { '' }
-            Row ("{0,-7} free{1}{2}" -f $n.ToUpper(), $kept, $tail) $(if ($q.Count) { 'Yellow' } else { 'Green' })
+            Row ("{0,-7} free{1}{2}" -f $n.ToUpper(), $kept, $tail) $(if ($first) { 'Yellow' } else { 'Green' })
         }
         $k = 0
         foreach ($w in $q) {
             $k++; $back = To-Utc $w.nextCheck; $late = $back -lt $now
-            $when = if ($late) { "LATE: checks back by $(Local-Hm $back), drops at $(Local-Hm $w.until)" } else { "checks back $(Local-Hm $back) ($(In-Min $back))" }
+            $when = if ($w.parked) { 'stands aside: waiting for a quiet GPU' } elseif ($late) { "LATE: checks back by $(Local-Hm $back), drops at $(Local-Hm $w.until)" } else { "checks back $(Local-Hm $back) ($(In-Min $back))" }
             Row ("    {0}. {1,-6} {2,-34} ~{3,3}m   starts ~{4} ({5})   {6}" -f $k, $w.by, $(if ($w.note) { "'$(Short $w.note 32)'" } else { '' }), [int][double]$w.est, (Local-Hm $w.start), (In-Min (To-Utc $w.start)), $when) $(if ($late) { 'Red' } else { 'Yellow' })
         }
     }
@@ -1028,15 +1101,15 @@ function Ansi-Rows($M, [int]$Width, [int]$Height) {
             $doneTxt = if ($over) { Seg ("  {0}m past its estimate" -f (-$left)) $K.red } else { Seg ("  done ~{0}" -f (Local-Hm $eta)) $K.txt }
             $leftTxt = if ($over) { Seg '' '' } else { Seg ("  ({0}m left)" -f $left) $K.dim }
             Add (@((Seg '              ' '')) + (Bar $frac 24 $(if ($over) { $K.red } else { $K.cyan })) + @($doneTxt, $leftTxt, (Seg "     expires $(Local-Hm $L.until)" $K.dim), (Seg $(if ($L.pid) { "   pid $($L.pid)" } else { '' }) $K.dim)))
-        } elseif ($q.Count) {
-            Add @((Seg '  ' ''), (Seg "$($Ch.dot) " $K.amber), $name, (Pill 'KEPT' $K.bamber), (Seg '  for ' $K.dim), (Seg $q[0].by $K.hi), (Seg "   first in line, until $(Local-Hm $q[0].until)" $K.dim))
+        } elseif ($first = Queue-First $q) {
+            Add @((Seg '  ' ''), (Seg "$($Ch.dot) " $K.amber), $name, (Pill 'KEPT' $K.bamber), (Seg '  for ' $K.dim), (Seg $first.by $K.hi), (Seg "   first in line, until $(Local-Hm $first.until)" $K.dim))
         } else {
-            Add @((Seg '  ' ''), (Seg "$($Ch.dot) " $K.green), $name, (Pill 'FREE' $K.bgreen), (Seg '  nobody waiting' $K.dim))
+            Add @((Seg '  ' ''), (Seg "$($Ch.dot) " $K.green), $name, (Pill 'FREE' $K.bgreen), (Seg $(if (@($q).Count) { '  waiters stand aside: anyone can take it' } else { '  nobody waiting' }) $K.dim))
         }
         $qi = 0
         foreach ($qe in $q) {
             $qi++; $back = To-Utc $qe.nextCheck; $late = $back -lt $now; $start = To-Utc $qe.start
-            $backSeg = if ($qe.job) { Seg 'AUTO: starts itself' $K.green } elseif ($late) { Seg "LATE, drops $(Local-Hm $qe.until)" $K.red } else { Seg (Local-Hm $back) $K.txt }
+            $backSeg = if ($qe.parked) { Seg 'aside: waiting for a quiet GPU' $K.cyan } elseif ($qe.job) { Seg 'AUTO: starts itself' $K.green } elseif ($late) { Seg "LATE, drops $(Local-Hm $qe.until)" $K.red } else { Seg (Local-Hm $back) $K.txt }
             Add @((Seg ('              {0} ' -f $qi) $K.dim), (Seg "$($Ch.arr) " $K.amber), (Seg ('{0,-6}' -f $qe.by) ($K.amber)), (Seg ('  {0,-36} ' -f (Short ([string]$qe.note) 36)) $K.txt),
                 (Seg ('{0,5}' -f ('~' + [int][double]$qe.est + 'm')) $K.dim), (Seg '   starts ' $K.dim), (Seg (Local-Hm $start) $K.txt), (Seg (' ({0})' -f (In-Min $start)) $K.dim), (Seg $(if ($qe.job) { '   ' } else { '   back ' }) $K.dim), $backSeg)
         }
@@ -1363,6 +1436,7 @@ switch ($Verb) {
                 $k++
                 $lab = if ($k -eq 1) { 'queue:' } else { '' }
                 $line = '          {0,-6} {1}. {2}{3} ~{4} min, expected start {5}, checks back by {6}' -f $lab, $k, $w.by, $(if ($w.note) { " '$($w.note)'" } else { '' }), $w.est, (Local-Hm $w.start), (Local-Hm $w.nextCheck)
+                if ($w.parked) { $line += "; stands aside, waiting for a quiet GPU, so the lease isn't kept for it" }
                 Write-Host $line -ForegroundColor Yellow
             }
         }
@@ -1518,19 +1592,8 @@ switch ($Verb) {
         if (-not (Get-Process -Id $tie -ErrorAction SilentlyContinue)) { Fail "-HolderPid $tie is not running" }
         if ($Minutes -le 0) { $Minutes = 720 }
         $min = Lease-Minutes $Lease
-        $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin)
-        $lastSaid = [DateTime]::MinValue
-        while ($true) {
-            # The queue keeps our place while we wait for the lease; quiet is checked once it's ours (others queue behind).
-            $res = Try-Take $Lease $min $tie
-            if ($res.ok) { break }
-            if ([DateTime]::UtcNow -ge $deadline) { [void](Do-Unqueue $Lease); Fail "gave up after $TimeoutMin min and left the queue; $(Wait-Text $res $Lease)" 2 }
-            if (([DateTime]::UtcNow - $lastSaid).TotalSeconds -ge 60) { Say "waiting: $(Wait-Text $res $Lease)" Yellow; $lastSaid = [DateTime]::UtcNow }
-            Start-Sleep -Seconds 5
-        }
-        if ($Lease -eq 'gpu' -and -not $NoQuiet -and -not (Wait-Quiet $deadline)) {
-            [void](Do-Release $Lease); Fail "no quiet GPU within $TimeoutMin min; gpu released" 3
-        }
+        $res = Wait-Lease $Lease $min $tie ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) ($Lease -eq 'gpu' -and -not $NoQuiet)
+        if (-not $res.ok) { Fail $res.msg $res.code }
         Say "$Lease held: $(Describe-Lease $res.cur)" Green
         exit 0
     }
@@ -1542,6 +1605,8 @@ switch ($Verb) {
             if (-not $jb) { Fail "no job $JobId in $JobDir" }
             $By = [string]$jb.runBy; $Lease = [string]$jb.lease; $Exe = [string]$jb.exe; $ArgList = [string]$jb.args; $For = [string]$jb.note
             $EstMin = [double]$jb.est; $NoQuiet = [bool]$jb.noQuiet; $TimeoutMin = [double]$jb.timeoutMin; $WorkDir = [string]$jb.cwd
+            # A job file from an older version has no quiet switches and keeps the defaults.
+            if ($null -ne $jb.maxVramGB) { $AllowEditor = [bool]$jb.allowEditor; $AllowBuild = [bool]$jb.allowBuild; $MaxVramGB = [double]$jb.maxVramGB; $MaxUtil = [int]$jb.maxUtil; $SettleSec = [int]$jb.settleSec }
             try { Start-Transcript -LiteralPath ([string]$jb.log) -Append | Out-Null } catch {}
         }
         function Job-End([string]$State, $Code, [string]$Why) {
@@ -1555,18 +1620,8 @@ switch ($Verb) {
         if (-not $Lease) { $Lease = 'gpu' }
         if ($Minutes -le 0) { $Minutes = 720 }
         $min = Lease-Minutes $Lease
-        $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin)
-        $lastSaid = [DateTime]::MinValue
-        while ($true) {
-            $res = Try-Take $Lease $min $PID
-            if ($res.ok) { break }
-            if ([DateTime]::UtcNow -ge $deadline) { [void](Do-Unqueue $Lease); Job-End 'failed' $null "gave up waiting for $Lease after $TimeoutMin min"; Fail "gave up after $TimeoutMin min and left the queue; $(Wait-Text $res $Lease)" 2 }
-            if (([DateTime]::UtcNow - $lastSaid).TotalSeconds -ge 60) { Say "waiting: $(Wait-Text $res $Lease)" Yellow; $lastSaid = [DateTime]::UtcNow }
-            Start-Sleep -Seconds 5
-        }
-        if (-not $NoQuiet -and -not (Wait-Quiet $deadline)) {
-            [void](Do-Release $Lease); Job-End 'failed' $null "no quiet GPU within $TimeoutMin min"; Fail "no quiet GPU within $TimeoutMin min; $Lease released, nothing started" 3
-        }
+        $res = Wait-Lease $Lease $min $PID ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) (-not $NoQuiet)
+        if (-not $res.ok) { Job-End 'failed' $null $res.why; Fail $res.msg $res.code }
         $code = 1; $why = ''
         try {
             $sp = @{ FilePath = $Exe; PassThru = $true }
@@ -1579,7 +1634,7 @@ switch ($Verb) {
                 $cur = Read-Lease $Lease
                 if ($cur -and $cur.by -eq $By -and [int]$cur.pid -eq $PID) { $cur.childPid = $p.Id; Write-Lease $Lease $cur }
             } | Out-Null
-            if ($JobId) { [void](Set-Job $JobId @{ state = 'running'; childPid = $p.Id } @('starting')) }
+            if ($JobId) { [void](Set-Job $JobId @{ state = 'running'; childPid = $p.Id; waiting = '' } @('starting')) }
             Say "$Lease held; started pid $($p.Id): $Exe $ArgList" Green
             $p.WaitForExit()
             $code = $p.ExitCode
