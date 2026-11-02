@@ -79,6 +79,8 @@ flowchart LR
     C[cop] -. every 5 s .-> P[processes]
     C -. uncovered -game run .-> X["stop + note in its -abslog"]
     C -. idle lease, someone waiting .-> F["release + note to its holder"]
+    C -. gpu job past its cap, someone waiting .-> Y["stop + note to its holder"]
+    C -. other holder past its cap, someone waiting .-> Z["over-cap alarm, stops nothing"]
     C -. runs .-> D
 ```
 
@@ -102,6 +104,15 @@ flowchart LR
 - **Abandoned leases go back.** Past its estimate with nothing of its kind running, a lease starts an idle clock (`status`
   shows it). After 10 minutes with someone in its queue, the cop releases it, logs `reap`, raises a toast and leaves a note
   for the holder. A running job is never released, and neither is a lease whose kind of work is running anywhere on the box.
+- **Every lease has a cap: 2 x its estimate + 5 minutes.** A `gpu` job past it, with someone queued, is stopped like `job -Cancel`
+  (state `overrun`). It loses only itself: its other queued jobs each take their turn and their own cap. A commandlet or an editor
+  in the job's tree writes assets, so it's never stopped: it only logs `over-cap` and raises a toast. `renew -EstMin <n>` moves the
+  cap to 2 x n + 5 from then. Set `$LaneBreakOn = $true` in `thor.ps1` if you'd rather a late job also cancel the `gpu` jobs queued under
+  its `-By` root (the text before the first dot), on the grounds that their estimates are suspect too.
+- **Holders the cap can't stop get an alarm.** Past the same cap with someone queued, a plain `take`, `run` or `hold` on any lease,
+  or a job on the `editor` or `build` lease, logs `over-cap` once per cap, raises a toast and leaves a note for the holder. Nothing
+  is stopped or released: stopping a `hold` would kill its caller's whole script.
+- **The queue plans around overruns.** A holder past its estimate counts as half the time left to its cap, at least 5 minutes.
 
 ## Leases at a glance
 
@@ -129,7 +140,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 |---|---|
 | `status [-Json]` | Leases, queues with expected starts, what's running, quiet-GPU verdict. |
 | `take <lease> -By <who> [-For] [-EstMin] [-Minutes] [-HolderPid] [-Wait] [-NoQueue]` | Take a lease or join its queue (exit 2). `-Wait` blocks in the queue. |
-| `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times. Never shortens. |
+| `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times and the cap. Never shortens. |
 | `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line who can use it. `-Force` only for a holder that's gone. |
 | `unqueue <lease> -By <who>` | Leave a queue. |
 | `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. |
@@ -138,7 +149,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `& hold [lease] -By <who> [-NoQuiet]` | For launcher scripts: take the lease tied to the calling process. Waits for quiet on `gpu` only. |
 | `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20] [-AllowEditor] [-AllowBuild]` | Is the GPU quiet? Exit 3 if not. `run`, `hold` and `submit` take the same switches. |
 | `watch [-Every 5] [-NoCop] [-NoToast] [-Plain] [-Frame -Cols -Rows] [-Fixture]` | The live board (and the cop). `-Frame` prints one frame and exits. |
-| `cop [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-ReapAfterMin 10]` | The enforcer + dispatcher without the board. `-CopDryRun` only says what it would stop or release; `-ReapAfterMin 0` keeps abandoned leases. |
+| `cop [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]` | The enforcer + dispatcher without the board. `-CopDryRun` only says what it would stop, release or log; `-CopMatch` limits it to matching command lines (for a holder with no job, its `-By` and `-For`); `-ReapAfterMin 0` keeps abandoned leases. |
 
 ### Job states
 
@@ -152,6 +163,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `cancelled` | `job -Cancel`. Its whole process tree goes with it. |
 | `expired` | It left the queue unstarted, past `-TimeoutMin` or unqueued. |
 | `lost` | Its runner died without reporting: killed, or the box restarted. |
+| `overrun` | The cop stopped it at its cap, with someone queued. Submit it again with a true estimate. |
 
 ## Configuration
 
@@ -160,7 +172,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `THOR_DIR` / `-Dir` | `%ProgramData%\ThorTraffic` | where leases, queues, jobs and the log live |
 | `THOR_GAME_EXE` / `-GameExe` | `-Win64-(Shipping\|Development\|Test\|DebugGame).exe$` | regex for your packaged game's process name |
 | `THOR_AGENT_MARKERS` | — | extra regex that marks a command line as an agent's |
-| `THOR_SCRATCH` / `-ScratchDir` | — | per-agent folders; the cop drops `THOR_COP.txt` in `<dir>\<who>\` when it stops a run or releases a lease |
+| `THOR_SCRATCH` / `-ScratchDir` | — | per-agent folders; the cop drops `THOR_COP.txt` in `<dir>\<who>\` when it stops a run or job, releases a lease or raises the alarm. For all but a stopped run, `<who>` is the `-By` root, so `ci.art0` reads `<dir>\ci\` |
 | `-ReapAfterMin` | `10` | minutes a lease stays idle past its estimate, with someone waiting, before the cop releases it; `0` turns that off |
 | `-ParkWarnMin` | `15` | minutes a wait for quiet runs before it logs `park-long`; then hourly |
 
@@ -174,6 +186,14 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
   so put `-Quiet` in your perf scripts.
 - **The cop can release a lease you still meant to use.** It errs toward keeping one, but a holder between steps, past its
   estimate with someone waiting, can lose it.
+- **The cap can stop a `gpu` job that was still working.** Past 2 x its estimate + 5 minutes with someone queued, it goes. Renew with a
+  true estimate while it runs. With nobody queued, or a commandlet or editor in its tree, it runs on.
+- **A bad estimate can repeat.** With the lane breaker off, a batch whose estimates are all too low runs each job to its own cap, one
+  after another, so the queue behind it waits longer.
+- **The alarm frees nothing.** A `hold`, a `run`, a plain `take` or an `editor` or `build` job past its cap keeps the lease until
+  someone acts, and a holder that keeps renewing never trips it.
+- **Nothing ends a running command by itself.** `-TimeoutMin` only limits a job's wait for the lease, so anything that can sit
+  under a real lease, a test above all, needs its own hard kill. A scratch `-Dir` has its own leases but still reads the real box.
 - **A build job's only guard against an open editor is the quiet wait.** With an editor open, `submit build` waits; `-NoQuiet`
   skips that, and the link can then fail on a DLL the editor has loaded.
 - **VRAM is a card total** — Windows (WDDM) doesn't report video memory per process.
@@ -182,13 +202,14 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 128 end-to-end checks in a throwaway state folder, about 9 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 266 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the
 process list in a copy of `thor.ps1`, on its own mutexes, so it can move the card from noisy to quiet under a waiter that's
-already running, hold the lock on purpose and never stall a live queue.
-Run that one alone with `-Shell powershell` to check it under Windows PowerShell 5.1.
+already running, hold the lock on purpose and never stall a live queue. It also includes `tests\cap-tests.ps1`, which uses real
+runners and real process trees in the same kind of copy, with the cap's pad cut to 0.1 min so a cap falls in seconds.
+Run either alone with `-Shell powershell` to check it under Windows PowerShell 5.1.
 
 ---
 

@@ -71,7 +71,12 @@ try {
     Start-Sleep -Seconds 2
     $j = Job $long.id
     $orphans = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $_.CommandLine -match '-n 26 127\.0\.0\.1' })
-    Check 'cancelled, whole tree gone, lease free' ($j.state -eq 'cancelled' -and -not (Get-Process -Id $j.childPid -ErrorAction SilentlyContinue) -and -not $orphans.Count -and (Status).leases.build.state -ne 'live')
+    Check 'cancelled: state' ($j.state -eq 'cancelled')
+    Check 'cancelled: its command is gone' (-not (Get-Process -Id $j.childPid -ErrorAction SilentlyContinue))
+    Check 'cancelled: its whole tree is gone' (-not $orphans.Count)
+    $st = (Status).leases.build
+    $script:out = "build lease: $($st.state), by $($st.lease.by)"
+    Check 'cancelled: the lease is free' ($st.state -ne 'live')
     # --- board: one frame from the demo fixture
     $DD = "$D-demo"
     & pwsh -NoProfile -File (Join-Path $root 'demo\seed.ps1') -Dir $DD | Out-Null
@@ -80,12 +85,14 @@ try {
     Check 'board frame renders' ($plain -match 'THOR TRAFFIC' -and $plain -match 'NEXT 90 MIN')
     Check 'board tags the uncovered run NO LEASE' ($plain -match 'NO LEASE')
     Check 'board shows the queued job as AUTO' ($plain -match 'AUTO: starts itself')
-    # --- waiting for a quiet GPU holds nothing (its own script: it stubs the GPU in a copy of thor.ps1)
-    $qp = 0; $qf = 0
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'quiet-wait-tests.ps1') | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
-    $qx = $LASTEXITCODE
-    $pass += $qp; $fail += $qf
-    if ($qx -and -not $qf) { $script:out = 'quiet-wait-tests.ps1 stopped before its end'; Check 'quiet-wait suite ran to its end' $false }
+    # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
+    foreach ($suite in @('quiet-wait', 'cap')) {
+        $qp = 0; $qf = 0
+        & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "$suite-tests.ps1") | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
+        $qx = $LASTEXITCODE
+        $pass += $qp; $fail += $qf
+        if ($qx -and -not $qf) { $script:out = "$suite-tests.ps1 stopped before its end"; Check "$suite suite ran to its end" $false }
+    }
 } finally {
     if (-not $Keep) { Start-Sleep -Seconds 1; Remove-Item $D, "$D-demo" -Recurse -Force -ErrorAction SilentlyContinue }
 }

@@ -31,10 +31,13 @@
 # A lease covers the work, not the session: release it the moment that step ends, before you wait on anything else, and
 # take it again when the next step is ready. A launcher handed to run or submit must wait for everything it starts, because
 # the lease ends when the launcher exits.
+# Wall clock: anything that can wait under a real lease, a test above all, needs its own hard kill at its estimate. -TimeoutMin only limits a job's wait for the
+# lease; nothing ends a command once it runs, and the overrun cap only acts when someone is waiting. A scratch -Dir has its own leases but reads the real box: quiet sees real processes.
 #
 # Waitlist. A take that finds the lease held joins its queue and is told its place, its expected start and when to check
 # back (never more than 10 min out, so an early release is noticed). Taking again at that time keeps the place; not back
-# within 5 min of it drops you. When a lease frees it is kept for the first in line until they check back.
+# within 5 min of it drops you. When a lease frees it is kept for the first in line until they check back. A holder past its
+# estimate counts as half the time left to its overrun cap (every lease has one for this sum), at least 5 more minutes, and never past its expiry.
 #
 # Standing aside. Only a wait for the lease itself reserves the lease. run, hold and jobs wait for quiet from the queue and
 # take the lease after -SettleSec, so its estimate starts with the work. While the GPU is noisy the waiter is parked: it
@@ -51,7 +54,7 @@
 # -MaxUtil and -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
 # stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting (its runner is up, and may
 # be waiting for quiet: the waiting field says why), running, done, failed, cancelled, expired (never started within
-# -TimeoutMin), lost (runner killed). Read a job back with job -JobId <id> -Json.
+# -TimeoutMin), lost (runner killed), overrun (stopped at its cap: see the cop). Read a job back with job -JobId <id> -Json.
 #
 # Quiet GPU. For anything timed: no other holder's gpu lease, under -MaxVramGB of video memory in use, the GPU under
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
@@ -77,13 +80,27 @@
 #   - it releases abandoned leases. A lease past its estimate with nothing of its kind running (editor: an editor or commandlet;
 #     build: UBT, UAT or a commandlet; gpu: a game, packaged run, local LLM or image generation, or the card over -MaxUtil; any
 #     lease: the command run started) gets idleSince on its file. Still idle after -ReapAfterMin (10) with someone in its queue,
-#     it goes: reap in lease.log, a toast and, with -ScratchDir, a note in <ScratchDir>\<who>\THOR_COP.txt. A renew clears the
-#     mark and -ReapAfterMin 0 turns this off. Anything on the box counts as use, whoever's it is, so this errs toward keeping a lease.
+#     it goes: reap in lease.log, a toast and, with -ScratchDir, a note in <ScratchDir>\<who>\THOR_COP.txt, <who> being its -By root. A renew clears the
+#     mark and -ReapAfterMin 0 turns this off. Anything on the box counts as use, whoever's it is, so this errs toward keeping a lease;
+#   - it caps overruns, because the reaper leaves a working job alone. A gpu job's cap falls 2 x its estimate + 5 min after it took the lease. A live gpu lease held by a dispatched
+#     job, past its cap, with someone in its queue (the job's own lane counts), is stopped the way job -Cancel stops one: state overrun, job-overrun in lease.log, a toast and,
+#     with -ScratchDir, a note. Small overruns are left alone, and with nobody waiting nothing happens until someone does. A commandlet or an editor anywhere in the job's tree
+#     writes assets and is never stopped: over-cap in lease.log once per job, and a toast. A -game or packaged run writes none and goes like anything else. A renew's estimate
+#     counts from the renew, so the cap is the lease's eta + est + 5: renew -EstMin <n> puts it 2 x n + 5 from then, and a plain renew inside the estimate leaves it. A plain renew
+#     past the estimate takes a fresh default estimate, and the cap follows. submit and the dispatch line give the time the cap falls; a job that waits for quiet takes the lease
+#     later, and its cap moves with it. -CopDryRun says what it would do; -CopMatch limits it to jobs whose command matches;
+#   - its lane breaker is off ($LaneBreakOn), so a stopped job loses only itself and its lane's queued jobs each take their turn and their own cap. With it on: when a gpu job is
+#     stopped by the cap, or ends past its cap on its own, the jobs in the gpu queue with its -By root (the text before the first dot: ci.art0 and ci.art10 share ci) are cancelled, with a
+#     why that names it, before the lease frees: job-cancel lines and a note. Their estimates are suspect too. Plain waiters, and that lane's jobs on other leases, stay;
+#   - it raises an over-cap alarm for a holder the cap can't stop, past the same cap with someone in its queue: a plain take, run or hold on any lease, or a job on the editor or
+#     build lease. Stopping a hold would kill its caller's whole script, so nothing is stopped or released: over-cap <lease> <by> [job <id>] (not stopped: ...) in lease.log, a toast, with
+#     -ScratchDir a note, and overCap on the lease file, so it is said once per cap. A renew writes a new lease, which clears the mark and moves the cap. -CopDryRun says what it
+#     would log; -CopMatch limits it to jobs whose command matches, and to other holders whose -By or -For does.
 #
 # Board (watch). A live terminal view for the human: GPU memory and load, each lease with its holder and countdown, the
 # queue with expected starts, the next 90 minutes as a timeline, what is running tagged with the lease covering it, and
 # lease.log. Alerts are Windows toasts for leases changing hands, holders past their estimate, late waiters, cop kills,
-# strikes, released leases, long waits for quiet, dispatched/finished jobs, uncovered runs and the GPU going quiet. Keys: q
+# strikes, released leases, long waits for quiet, dispatched/finished jobs, overruns, uncovered runs and the GPU going quiet. Keys: q
 # quits, t toggles alerts.
 # -Frame prints one coloured frame and exits (docs, CI). -Fixture replays fake processes and GPU readings (demo, tests).
 #
@@ -145,7 +162,7 @@ $DefaultMin = @{ editor = 120; gpu = 30; build = 60 }
 $LeaseDir = Join-Path $Dir 'leases'
 $QueueDir = Join-Path $Dir 'queue'
 $JobDir = Join-Path $Dir 'jobs'; $JobWaitMin = 240
-$CheckMaxMin = 10; $CheckMinMin = 1; $GraceMin = 5; $OverrunMin = 5
+$CheckMaxMin = 10; $CheckMinMin = 1; $GraceMin = 5; $OverrunMin = 5; $CapPadMin = 5; $LaneBreakOn = $false
 $LogFile = Join-Path $Dir 'lease.log'
 $Utf8 = New-Object Text.UTF8Encoding $false
 New-Item -ItemType Directory -Force $LeaseDir, $QueueDir | Out-Null
@@ -273,14 +290,20 @@ function Queue-First($Q) {
     return $null
 }
 function Quiet-Key { return "$([bool]$AllowEditor)|$([bool]$AllowBuild)|$MaxVramGB|$MaxUtil" }
+function Cap-Span([double]$Est) { return 2 * $Est + $CapPadMin }
+function Cap-At($L) {
+    # When a holder's overrun cap falls (header: the cop): 2 x est + pad after its take. A renew's est counts from the renew, so it is eta + est + pad, never before the eta.
+    if (-not $L -or -not $L.eta) { return $null }
+    return (To-Utc $L.eta).AddMinutes([double]$L.est + $CapPadMin)
+}
 function Free-At($L, [string]$State) {
-    # When the current holder should be done: its estimate, capped at its expiry; past the estimate, OverrunMin more.
+    # When the current holder should be done: its estimate; past that, half the time left to its cap, at least OverrunMin. Never after its expiry.
     $now = [DateTime]::UtcNow
     if ($State -ne 'live') { return $now }
     $until = To-Utc $L.until
     $eta = if ($L.eta) { To-Utc $L.eta } else { $until }
+    if ($eta -le $now) { $eta = $now.AddMinutes([Math]::Max($OverrunMin, ((Cap-At $L) - $now).TotalMinutes / 2)) }
     if ($eta -gt $until) { $eta = $until }
-    if ($eta -le $now) { $eta = $now.AddMinutes($OverrunMin) }
     return $eta
 }
 function Plan-Queue($Entries, [DateTime]$FreeAt) {
@@ -482,10 +505,15 @@ function Do-Submit {
         $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
         Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
     } else { Say "job $($res.id): $Lease was free; $($j.state) now" Green }
+    if ($Lease -eq 'gpu') {
+        $capT = $(if ($j.state -eq 'queued') { $res.start } else { [DateTime]::UtcNow }).AddMinutes((Cap-Span $est))
+        Say "its cap falls about $(Local-Hm $capT), $(Cap-Span $est) min after it starts (2 x est + $CapPadMin). Past that with someone waiting, the cop stops it$(if ($LaneBreakOn) { " and cancels its lane's queued jobs" }); renew gpu -By $($res.runBy) -EstMin <n> moves it."
+    }
     if ($Lease -eq 'gpu' -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
+function Job-CapAt($J) { return (To-Utc $J.started).AddMinutes((Cap-Span ([double]$J.est))) }
 function Dispatch-Pass {
     # Starts a lease's first ready waiter when it is a submitted job and nobody holds the lease (free, kept for that job). Safe to
     # call from any process: queued -> starting flips under the lease mutex, so a job starts once. Also settles jobs whose runner
@@ -503,7 +531,7 @@ function Dispatch-Pass {
             $j = Read-Job ([string]$first.job)
             if (-not $j -or [string]$j.state -ne 'queued') { return $null }
             $j.state = 'starting'; $j.started = Now-Iso; Write-Job $j
-            Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($j.note) { " for: $($j.note)" })"
+            Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($nm -eq 'gpu') { " cap ~$(Iso (Job-CapAt $j))" })$(if ($j.note) { " for: $($j.note)" })"
             return $j
         }
         if (-not $go) { continue }
@@ -557,6 +585,17 @@ function Stop-Tree([int]$Root) {
         foreach ($c in @($kids[$cur])) { if ($c -and $c -ne $cur -and (-not $born[$cur] -or $born[$c] -ge $born[$cur])) { $stack.Push($c) } }
     }
     for ($i = $order.Count - 1; $i -ge 0; $i--) { Stop-Process -Id $order[$i] -Force -ErrorAction SilentlyContinue }
+}
+function Stop-JobTree($Jb) {
+    # Stops a running job: the command's whole tree first (a cmd /c or a launcher leaves children that keep running and hold the
+    # output logs open), so the runner releases the lease itself; then the runner, if it is still there.
+    if ($Jb.childPid) { Stop-Tree ([int]$Jb.childPid) }
+    Start-Sleep -Seconds 3
+    if ($Jb.runPid -and (Get-Process -Id ([int]$Jb.runPid) -ErrorAction SilentlyContinue)) {
+        # runPid is the headless console; its runner is the pwsh under it.
+        foreach ($rc in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$([int]$Jb.runPid)" -ErrorAction SilentlyContinue)) { Stop-Process -Id $rc.ProcessId -Force -ErrorAction SilentlyContinue }
+        Stop-Process -Id ([int]$Jb.runPid) -Force -ErrorAction SilentlyContinue
+    }
 }
 function Job-Line($J) {
     $t = { param($v) if ($v) { Local-Hm $v } else { '--:--' } }
@@ -771,10 +810,7 @@ function Reap-Pass($Procs, $Leases) {
             }
             if (-not $gone) { continue }
             $out += @{ lease = $n; by = $L.by; why = $why }
-            if ($ScratchDir) {
-                $d = Join-Path $ScratchDir (([string]$L.by) -replace '\.j\d+$', '')
-                if (Test-Path $d) { try { [IO.File]::AppendAllText((Join-Path $d 'THOR_COP.txt'), "`r`n[THOR COP] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') released your $n lease: $why.`r`n[THOR COP] A lease covers the work, not the session. Take it again when the next step is ready, or renew -EstMin if the step is still going.`r`n", $Utf8) } catch {} }
-            }
+            Cop-Note ([string]$L.by) "released your $n lease: $why.`r`n[THOR COP] A lease covers the work, not the session. Take it again when the next step is ready, or renew -EstMin if the step is still going."
             continue
         }
         if ($CopDryRun -or $idle -eq [bool]$L.idleSince) { continue }
@@ -787,6 +823,141 @@ function Reap-Pass($Procs, $Leases) {
         } | Out-Null
     }
     return , $out
+}
+function Lane-Root([string]$Who) { return ($Who -split '\.')[0] }
+function Cop-Note([string]$Who, [string]$Text) {
+    # What the holder's agent reads, with -ScratchDir: <ScratchDir>\<who>\THOR_COP.txt, <who> being its -By root (ci.art0 -> ci).
+    if (-not $ScratchDir) { return }
+    $d = Join-Path $ScratchDir (Lane-Root $Who)
+    if (Test-Path $d) { try { [IO.File]::AppendAllText((Join-Path $d 'THOR_COP.txt'), "`r`n[THOR COP] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Text`r`n", $Utf8) } catch {} }
+}
+function Lane-Queued($Over, [string]$Name) {
+    # The jobs of its lane still in this queue. A job parked for quiet reads as starting, but it has started nothing.
+    $root = Lane-Root ([string]$Over.by); $out = @()
+    foreach ($e in @(Read-Queue $Name)) {
+        if (-not $e.job -or [string]$e.job -eq [string]$Over.id) { continue }
+        $j = Read-Job ([string]$e.job)
+        if ($j -and [string]$j.state -in @('queued', 'starting') -and (Lane-Root ([string]$j.by)) -eq $root) { $out += $j }
+    }
+    return $out
+}
+function Lane-Break($Over, [string]$Name) {
+    # The lane breaker (header: the cop), off while $LaneBreakOn is. Runs before the lease frees and under the lock, so none of them can be dispatched first.
+    if (-not $LaneBreakOn) { return '' }
+    $why = "lane breaker: $($Over.runBy) (job $($Over.id)) went over its cap"
+    $gone = With-Lock {
+        $names = @()
+        foreach ($j in @(Lane-Queued $Over $Name)) {
+            $was = [string]$j.state
+            $j.state = 'cancelled'; $j.ended = Now-Iso; $j.why = $why; Write-Job $j
+            Log-Line "job-cancel $Name $($j.runBy) job $($j.id) (was $was; $why)"
+            $names += [string]$j.runBy
+        }
+        if ($names.Count) { Write-Queue $Name @(Read-Queue $Name | Where-Object { $names -notcontains [string]$_.by }) }
+        return ($names -join ', ')
+    }
+    if ($gone) { Cop-Note ([string]$Over.by) "cancelled your queued $Name jobs $($gone): $($Over.runBy) went over its cap, so their estimates are suspect too. Fix -EstMin and submit them again." }
+    return $gone
+}
+function Asset-Writer([int]$Root, $Procs) {
+    # A commandlet or an editor in the tree under $Root, from Get-Procs' table. A -game run isn't one: the cop already stops those, and it writes no assets.
+    foreach ($p in @($Procs | Where-Object { $_.kind -in @('commandlet', 'editor') })) {
+        $cur = $p.pid
+        for ($i = 0; $i -lt 32; $i++) {
+            if ($cur -eq $Root) { return $p }
+            $me = $script:Info[$cur]; if (-not $me) { break }
+            $par = $script:Info[$me.parent]
+            if (-not $par -or $me.parent -eq $cur -or $par.started -gt $me.started) { break }
+            $cur = $me.parent
+        }
+    }
+    return $null
+}
+function Lease-Job($L, [string[]]$States = @('running')) {
+    # The running job that holds a lease, or nothing for a plain take, run or hold. On a lease a job goes by its runBy; a name comes back only after its job ended, so the newest file wins.
+    if ([string]$L.by -notmatch '\.j\d+$' -or -not (Test-Path $JobDir)) { return $null }
+    foreach ($f in @(Get-ChildItem $JobDir -Filter "$($L.by)-*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)) {
+        $j = Read-Job $f.BaseName
+        if ($j -and [string]$j.runBy -eq [string]$L.by -and [string]$j.state -in $States) { return $j }
+    }
+    return $null
+}
+function Cap-Pass($Leases) {
+    # Stops a gpu job past its cap with someone waiting (header: the cop). With a commandlet or an editor in its tree it only says so. Plain takes and the other leases go to Alarm-Pass.
+    $out = @()
+    $x = $Leases['gpu']
+    if ($x.state -ne 'live') { return $out }
+    $L = $x.lease; $now = [DateTime]::UtcNow
+    $cap = Cap-At $L
+    if (-not $cap -or $now -lt $cap) { return $out }
+    $waiting = (Live-Queue 'gpu' ([string]$L.by)).Count
+    if (-not $waiting) { return $out }
+    $j = Lease-Job $L
+    if (-not $j -or -not $j.childPid) { return $out }
+    if ($CopMatch -and "$($j.exe) $($j.args)" -notmatch $CopMatch) { return $out }
+    $over = "held $([int]($now - (To-Utc $L.taken)).TotalMinutes) min on an estimate of $($L.est) min, past its cap $(Local-Hm $cap), $waiting waiting"
+    # A fresh list, not the pass's: a chain may have started a commandlet in the seconds since.
+    $writer = Asset-Writer ([int]$j.childPid) @(Get-Procs)
+    if ($writer) {
+        if ($j.overCap) { return $out }
+        $what = "$($writer.kind) pid $($writer.pid) in its tree, not stopped"
+        if ($CopDryRun) { Say "would log over-cap for job $($j.id) ($what): $over" Yellow; return $out }
+        if (Set-Job $j.id @{ overCap = Now-Iso } @('running')) { Log-Line "over-cap gpu $($L.by) job $($j.id) ($what`: $over)" }
+        $out += @{ job = $j.id; by = $L.by; stopped = $false; why = "$what`: $over" }
+        return $out
+    }
+    if ($CopDryRun) {
+        $sibs = if ($LaneBreakOn) { @(Lane-Queued $j 'gpu' | ForEach-Object { [string]$_.runBy }) -join ', ' } else { '' }
+        Say "would stop job $($j.id) ($over)$(if ($sibs) { " and cancel $sibs" })" Yellow
+        return $out
+    }
+    $marked = With-Lock {
+        # It may have renewed, or ended, since the look above. Marked first, so the runner's own ending can't write over it.
+        $cur = Read-Lease 'gpu'; $jn = Read-Job $j.id
+        if (-not $cur -or $cur.by -ne $L.by -or [string]$cur.taken -ne [string]$L.taken -or [string]$cur.eta -ne [string]$L.eta) { return $false }
+        if (-not $jn -or [string]$jn.state -ne 'running' -or -not (Get-Process -Id ([int]$j.childPid) -ErrorAction SilentlyContinue)) { return $false }
+        $jn.state = 'overrun'; $jn.ended = Now-Iso; $jn.why = "stopped by the cop at its overrun cap: $over"; Write-Job $jn
+        Log-Line "job-overrun gpu $($L.by) job $($j.id) ($over)"
+        return $true
+    }
+    if (-not $marked) { return $out }
+    $gone = Lane-Break $j 'gpu'
+    Stop-JobTree $j
+    Cop-Note ([string]$j.by) "stopped your job $($j.id) at its overrun cap: $over.`r`n[THOR COP] The cap is 2 x -EstMin + $CapPadMin min. Submit it again with a true estimate; while a job runs, renew gpu -By $($L.by) -EstMin <n> moves its cap to 2 x n + $CapPadMin from then."
+    $out += @{ job = $j.id; by = $L.by; stopped = $true; why = "$over$(if ($gone) { "; cancelled $gone" })" }
+    return $out
+}
+function Alarm-Pass($Leases) {
+    # A holder past its cap that Cap-Pass can't stop, with someone waiting: says so once per cap and stops nothing (header: the cop).
+    $out = @()
+    foreach ($n in $Names) {
+        $x = $Leases[$n]
+        if ($x.state -ne 'live' -or $x.lease.overCap) { continue }
+        $L = $x.lease; $now = [DateTime]::UtcNow
+        $cap = Cap-At $L
+        if (-not $cap -or $now -lt $cap) { continue }
+        $waiting = (Live-Queue $n ([string]$L.by)).Count
+        if (-not $waiting) { continue }
+        # A gpu job is the cap's. A job just stopped can keep its lease for a moment, until its runner lets go.
+        $j = Lease-Job $L @('running', 'overrun', 'cancelled')
+        if ($j -and ($n -eq 'gpu' -or [string]$j.state -ne 'running')) { continue }
+        if ($CopMatch -and $(if ($j) { "$($j.exe) $($j.args)" } else { "$($L.by) $($L.note)" }) -notmatch $CopMatch) { continue }
+        $tag = if ($j) { " job $($j.id)" } else { '' }
+        $over = "held $([int]($now - (To-Utc $L.taken)).TotalMinutes) min on an estimate of $($L.est) min, past its cap $(Local-Hm $cap), $waiting waiting"
+        if ($CopDryRun) { Say "would log over-cap for $($L.by)'s $n lease$tag`: $over" Yellow; continue }
+        $said = With-Lock {
+            # It may have renewed, or ended, since the look above.
+            $cur = Read-Lease $n
+            if (-not $cur -or $cur.overCap -or $cur.by -ne $L.by -or [string]$cur.taken -ne [string]$L.taken -or [string]$cur.eta -ne [string]$L.eta) { return $false }
+            $cur | Add-Member -NotePropertyName overCap -NotePropertyValue (Now-Iso) -Force; Write-Lease $n $cur
+            Log-Line "over-cap $n $($L.by)$tag (not stopped: $over)"
+            return $true
+        }
+        if (-not $said) { continue }
+        Cop-Note ([string]$L.by) "your $n lease is past its overrun cap: $over. Nothing was stopped.`r`n[THOR COP] Done with it? release $n -By $($L.by). Still working? renew $n -By $($L.by) -EstMin <minutes left>, so the queue's times are true."
+        $out += @{ lease = $n; by = $L.by; job = $(if ($j) { $j.id }); why = $over }
+    }
+    return $out
 }
 function Status-Queue([string]$Name, $X) {
     $holder = if ($X.state -eq 'live') { [string]$X.lease.by } else { '' }
@@ -1013,7 +1184,9 @@ function Board-Model {
         if ($cp.killed.Count) { $script:CopKills += $cp.killed.Count; Start-Sleep -Milliseconds 800; $m.procs = Get-Procs; $m.gpu = Get-Gpu 2 }
     }
     if ($script:CopOn) { try { if ((Reap-Pass $m.procs $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
-    if ($script:CopOn) { try { if (@(Dispatch-Pass).Count) { $m.leases = Get-Leases } } catch {} }
+    if ($script:CopOn) { try { if (@(Cap-Pass $m.leases).Count) { $m.leases = Get-Leases; $m.procs = Get-Procs } } catch {} }
+    if ($script:CopOn) { try { if (@(Alarm-Pass $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
+    if ($script:CopOn) { try { if ((Dispatch-Pass).Count) { $m.leases = Get-Leases } } catch {} }
     $m.cov = Coverage $m.procs $m.leases
     $m.reasons = Quiet-Reasons $m.gpu $m.procs $m.leases
     $m.queues = @{}; foreach ($n in $Names) { $m.queues[$n] = @(Status-Queue $n $m.leases[$n]) }
@@ -1080,7 +1253,7 @@ function Board-Lines($M) {
     Row "RECENT  ($LogFile)" 'White'
     if (-not $M.log.Count) { Row '  (no log yet)' 'DarkGray' }
     foreach ($e in $M.log) {
-        $c = switch -Regex ($e.verb) { '^take|^renew' { 'Cyan' } '^queue' { 'Yellow' } '^dequeue|^lapse|forced|^cop|^reap|^park-long' { 'Red' } default { 'Gray' } }
+        $c = switch -Regex ($e.verb) { '^take|^renew' { 'Cyan' } '^queue' { 'Yellow' } '^dequeue|^lapse|forced|^cop|^reap|^park-long|^job-overrun|^over-cap' { 'Red' } default { 'Gray' } }
         Row ("  {0}  {1,-8} {2,-7} {3,-7} {4}" -f $e.t, $e.verb, $e.lease, $e.by, $e.rest) $c
     }
     return , $rows
@@ -1231,7 +1404,7 @@ function Ansi-Rows($M, [int]$Width, [int]$Height) {
     $log = @($M.log | Select-Object -Last $room)
     if (-not $log.Count) { Add @((Seg '  (no lease events yet)' $K.dim)) }
     foreach ($e in $log) {
-        $vc = switch -Regex ($e.verb) { '^take|^renew' { $K.cyan } '^release|^unqueue' { $K.green } '^queue' { $K.amber } '^dequeue|^lapse|forced|^cop|^reap|^park-long' { $K.red } default { $K.txt } }
+        $vc = switch -Regex ($e.verb) { '^take|^renew' { $K.cyan } '^release|^unqueue' { $K.green } '^queue' { $K.amber } '^dequeue|^lapse|forced|^cop|^reap|^park-long|^job-overrun|^over-cap' { $K.red } default { $K.txt } }
         Add @((Seg "  $($e.t)  " $K.dim), (Seg ('{0,-11}' -f $e.verb) $vc), (Seg ('{0,-7}' -f $e.lease) $K.txt), (Seg ('{0,-6}' -f $e.by) $K.hi), (Seg "  $($e.rest)" $K.dim))
     }
     Add @((Seg "  q quits  $($Ch.mid)  t alerts on/off  $($Ch.mid)  r re-reads sessions  $($Ch.mid)  $(Show-Path $Dir)  $($Ch.mid)  -Plain for plain text  $($Ch.mid)  COP: $(Cop-Text)" $K.dim))
@@ -1296,7 +1469,7 @@ function Who-Style([string]$Who) {
     return $pal[$sum % $pal.Count]
 }
 function Timeline-Rows($M, [int]$Wid) {
-    # Next 90 minutes per lease: the holder until its estimate (past it counts $OverrunMin more, as the queue plans), then
+    # Next 90 minutes per lease: the holder until the queue expects it done (Free-At), then
     # each waiter from its expected start for its estimate. Bold = holds it now; plain = waiting.
     $KK = $script:K; $now = $M.now; $span = 90
     $cols = [Math]::Max(30, $Wid - 12); $perCol = $span / $cols
@@ -1313,8 +1486,7 @@ function Timeline-Rows($M, [int]$Wid) {
         $x = $M.leases[$n]; $spans = @()
         if ($x.state -eq 'live') {
             $L = $x.lease
-            $end = if ($L.eta) { To-Utc $L.eta } else { To-Utc $L.until }
-            if ($end -le $now) { $end = $now.AddMinutes($OverrunMin) }
+            $end = Free-At $L 'live'
             $spans += @{ who = [string]$L.by; a = $now; b = $end; held = $true }
         }
         foreach ($qe in @($M.queues[$n])) {
@@ -1443,7 +1615,7 @@ function Watch-Alerts($M) {
             $ts = $Matches[1]; $vb = $Matches[2]
             if ([string]::CompareOrdinal($ts, $al.logAt) -le 0) { continue }
             $al.logAt = $ts
-            if ($vb -match '^(cop-kill|strike|lapse|dequeue|dispatch|job-|reestimate|reap|park-long)' -or $ln -match ' forced') { $ev.Add((Short ("$vb " + ($ln -replace '^\S+ \S+ ', '')) 160)) }
+            if ($vb -match '^(cop-kill|strike|lapse|dequeue|dispatch|job-|over-cap|reestimate|reap|park-long)' -or $ln -match ' forced') { $ev.Add((Short ("$vb " + ($ln -replace '^\S+ \S+ ', '')) 160)) }
         }
     }
     # runs no lease covers
@@ -1608,7 +1780,9 @@ switch ($Verb) {
             try { $procs = @(Get-Procs); $cp = Cop-Pass $procs (Get-Leases); foreach ($k in $cp.killed) { Say "stopped pid $($k.pid): $($k.cmd)" Red } } catch { Say "cop pass failed: $($_.Exception.Message)" Yellow }
             # No process list means no judging who is idle.
             if ($null -ne $procs) { try { foreach ($rp in (Reap-Pass $procs (Get-Leases))) { Say "released $($rp.lease) from $($rp.by): $($rp.why)" Yellow } } catch { Say "reap pass failed: $($_.Exception.Message)" Yellow } }
-            try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
+            try { foreach ($cj in (Cap-Pass (Get-Leases))) { Say "$(if ($cj.stopped) { 'stopped' } else { 'over its cap, not stopped:' }) job $($cj.job): $($cj.why)" Red } } catch { Say "cap pass failed: $($_.Exception.Message)" Yellow }
+            try { foreach ($ca in (Alarm-Pass (Get-Leases))) { Say "over its cap, not stopped: $($ca.by)'s $($ca.lease) lease$(if ($ca.job) { " (job $($ca.job))" }): $($ca.why)" Red } } catch { Say "alarm pass failed: $($_.Exception.Message)" Yellow }
+            try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)$(if ($dj.lease -eq 'gpu') { " (cap ~$(Local-Hm (Job-CapAt $dj)))" })" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
             if ($Once) { exit 0 }
             Start-Sleep -Seconds ([Math]::Max(2, $Every))
         }
@@ -1734,6 +1908,13 @@ switch ($Verb) {
             $code = $p.ExitCode
             Say "pid $($p.Id) exited $code"
         } finally {
+            # A gpu job that ended past its cap on its own: its lane's queued jobs go first, while it still holds the lease (header: the cop).
+            if ($JobId -and $Lease -eq 'gpu') {
+                try {
+                    $cur = Read-Lease $Lease; $cap = Cap-At $cur; $jn = Read-Job $JobId
+                    if ($cap -and [DateTime]::UtcNow -gt $cap -and $cur.by -eq $By -and [string]$jn.state -eq 'running') { [void](Lane-Break $jn $Lease) }
+                } catch { Say "lane breaker failed: $($_.Exception.Message)" Yellow }
+            }
             # The lease is tied to this process, so it ends with it anyway; the job's exit code has only this one chance to land.
             try {
                 With-Lock {
@@ -1770,17 +1951,7 @@ switch ($Verb) {
             if ($was -notin @('queued', 'starting', 'running')) { Say "job $JobId is already $was"; exit 0 }
             [void](Set-Job $JobId @{ state = 'cancelled'; ended = Now-Iso; why = "cancelled$(if ($By) { " by $($By.Trim().ToLower())" })" })
             Drop-JobEntry ([string]$jb.lease) ([string]$jb.runBy)
-            if ($was -ne 'queued') {
-                # Stop the command's whole tree first (a cmd /c or a launcher leaves children that keep running and hold the
-                # output logs open), so the runner releases the lease itself; then the runner, if it is still there.
-                if ($jb.childPid) { Stop-Tree ([int]$jb.childPid) }
-                Start-Sleep -Seconds 3
-                if ($jb.runPid -and (Get-Process -Id ([int]$jb.runPid) -ErrorAction SilentlyContinue)) {
-                    # runPid is the headless console; its runner is the pwsh under it.
-                    foreach ($rc in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$([int]$jb.runPid)" -ErrorAction SilentlyContinue)) { Stop-Process -Id $rc.ProcessId -Force -ErrorAction SilentlyContinue }
-                    Stop-Process -Id ([int]$jb.runPid) -Force -ErrorAction SilentlyContinue
-                }
-            }
+            if ($was -ne 'queued') { Stop-JobTree $jb }
             Log-Line "job-cancel $($jb.lease) $($jb.runBy) job $JobId (was $was)"
             Say "job $JobId cancelled (was $was)" Green; exit 0
         }

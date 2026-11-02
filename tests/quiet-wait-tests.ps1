@@ -258,6 +258,12 @@ try {
     Check 'the waiter gets it' ((TL take gpu -By rw) -eq 0)
     TL release gpu -By rw | Out-Null
 
+    New-Item -ItemType Directory -Force (Join-Path $scr 'rdot') | Out-Null
+    Stale gpu rdot.art0.j1; Waiter gpu rwd
+    Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a dotted -By is told under its root' (-not (L gpu) -and (Test-Path (Join-Path $scr 'rdot\THOR_COP.txt')) -and (Get-Content (Join-Path $scr 'rdot\THOR_COP.txt') -Raw) -match 'released your gpu lease')
+    TL unqueue gpu -By rwd | Out-Null
+
     Stale gpu rs; Waiter gpu rw0
     TL cop -Once -ReapAfterMin 0.01 | Out-Null; Start-Sleep 2; TL cop -Once -ReapAfterMin 0.01 | Out-Null
     Check 'with no -ScratchDir it still releases, cleanly' (-not (L gpu) -and $last -notmatch 'reap pass failed')

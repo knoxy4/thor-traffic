@@ -13,7 +13,7 @@ THOR TRAFFIC - this workstation is shared by several agents and a human. Leases 
   (<thor> release <lease> -By <you>). Your estimate is everyone else's wait time - don't lowball it.
 - A lease covers the work, not the session: release it the moment that step ends, before you wait on anything else,
   and take it again when the next step is ready. Don't renew it through idle time.
-- Running long: <thor> renew <lease> -By <you> -EstMin <minutes still needed>. The queue's times move with it.
+- Running long: <thor> renew <lease> -By <you> -EstMin <minutes still needed>. The queue's times and your cap move with it.
 - Held (exit 2) = you're queued. Don't spin. Prefer fire-and-forget:
   <thor> submit <lease> -By <you> -Exe <exe> -ArgList '<args>' -For '<what>' -EstMin <n> [-WorkDir <dir>]
   Thor starts it the moment the lease is yours. A gpu job waits for a quiet GPU only with -Quiet; an editor or build job
@@ -26,5 +26,11 @@ THOR TRAFFIC - this workstation is shared by several agents and a human. Leases 
 - A cop is always on: an agent -game or packaged run that the gpu lease doesn't cover is stopped after 45 s, with the
   reason appended to its -abslog. A C++ build without the build lease is logged as a strike. A lease past its estimate with
   nothing running and someone waiting gets released: renew -EstMin if the step is still going.
+- Every lease has a cap: 2 x its estimate + 5 min. Past it with someone waiting, a gpu job is stopped (state overrun), unless
+  it runs a commandlet or an editor. Your other queued jobs still run, each with its own cap.
+  Anything else past its cap (a plain take, run, hold, or a job on the editor or build lease) gets an over-cap alarm and a toast,
+  and stops nothing: release it, or renew -EstMin with a true estimate.
+- Nothing ends a running command by itself: -TimeoutMin only limits the wait for the lease. Anything that can sit under a real
+  lease, a test above all, needs its own hard kill at its estimate.
 - Never -Force someone else's lease. Ask the human.
 ```
