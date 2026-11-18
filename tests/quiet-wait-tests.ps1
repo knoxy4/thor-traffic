@@ -298,23 +298,23 @@ try {
 
     # --- strikes as data: a profile's strike kinds are logged, never stopped; a probed daemon only while nobody holds the lease
     $sp = Join-Path $PSScriptRoot 'strike-profile.json'
-    function SC { TL cop -Once -ReapAfterMin 0 -ProfilePath $sp @args | Out-Null }
+    function StrikeCop { TL cop -Once -ReapAfterMin 0 -ProfilePath $sp @args | Out-Null }
     function Said([string]$Rx) { return ([regex]::Matches((LogText), $Rx)).Count }
     Procs '[{"kind":"train","cpp":false,"pid":999981,"name":"python.exe","cmd":"train.py","full":"python.exe train.py -log=t.log","started":"2026-01-01T00:00:00Z"},{"kind":"compile","cpp":true,"pid":999982,"name":"cl.exe","cmd":"/c x.cpp","full":"cl.exe /c x.cpp","started":"2026-01-01T00:00:00Z"},{"kind":"llm","cpp":false,"idle":false,"pid":999983,"name":"ollama.exe","cmd":"serve","full":"ollama.exe serve","started":"2026-01-01T00:00:00Z"}]'
-    SC -CopDryRun
+    StrikeCop -CopDryRun
     Check 'strike: -CopDryRun says it and logs nothing' ($last -match 'would log a strike: pid 999981' -and (Said 'strike \S+ 99998[123]') -eq 0)
-    SC
+    StrikeCop
     Check 'strike: an agent''s run of a strike kind is logged' ((Said 'strike gpu 999981 \? \(a train run without the gpu lease; not stopped\)') -eq 1)
     Check 'strike: a C++ kind is logged as a build' ((Said 'strike build 999982 \? \(a C\+\+ build without the build lease; not stopped\)') -eq 1)
     Check 'strike: a busy daemon with nobody on the lease is logged' ((Said 'strike gpu 999983 \? \(a busy llm daemon with nobody on the gpu lease; not stopped\)') -eq 1)
     Check 'strike: nothing is stopped' ((Said 'cop-kill \S+ 99998') -eq 0)
     TL take gpu -By sx -EstMin 5 | Out-Null
     Procs '[{"kind":"llm","cpp":false,"idle":false,"pid":999984,"name":"ollama.exe","cmd":"serve","full":"ollama.exe serve","started":"2026-01-01T00:00:00Z"}]'
-    SC
+    StrikeCop
     Check 'strike: a busy daemon while someone holds the lease is not' ((Said 'strike gpu 999984') -eq 0)
     TL release gpu -By sx | Out-Null
     Procs '[{"kind":"llm","cpp":false,"idle":true,"pid":999985,"name":"ollama.exe","cmd":"serve","full":"ollama.exe serve","started":"2026-01-01T00:00:00Z"}]'
-    SC
+    StrikeCop
     Check 'strike: an idle daemon is not' ((Said 'strike gpu 999985') -eq 0)
     Procs '[{"kind":"build","cpp":true,"pid":999986,"name":"UnrealBuildTool.exe","cmd":"x","full":"UnrealBuildTool.exe Game Win64 Development","started":"2026-01-01T00:00:00Z"},{"kind":"build","cpp":false,"pid":999987,"name":"ShaderCompileWorker.exe","cmd":"x","full":"ShaderCompileWorker.exe","started":"2026-01-01T00:00:00Z"}]'
     TL cop -Once -ReapAfterMin 0 | Out-Null

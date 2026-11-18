@@ -20,6 +20,7 @@ function Wait-Job([string]$Id, [string[]]$States, [int]$Sec = 40) {
     while ([DateTime]::UtcNow -lt $t) { $j = Job $Id; if ([string]$j.state -in $States) { return $j }; Start-Sleep -Milliseconds 700 }
     return (Job $Id)
 }
+function UT($v) { if ($v -is [DateTime]) { return $v.ToUniversalTime() }; $st = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal; return [DateTime]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture, $st) }
 function LastId { if ($script:out -match 'job -JobId (\S+)') { return $Matches[1] }; return '' }
 function Hold-Cmd([int]$Sec) { "/c ping -n $($Sec + 1) 127.0.0.1 >nul" }
 try {
@@ -180,18 +181,21 @@ try {
     Check 'not before: it stays queued and the job says when' ($nbj.state -eq 'queued' -and $nbj.notBefore -and @((Status).queues.build)[0].notBefore)
     Check 'not before: the lease is not kept for it' ((T take build -By nbx -NoQueue) -eq 0)
     [void](T release build -By nbx)
-    $nbAt = [DateTime]::Parse([string]$nbj.notBefore).ToUniversalTime(); $wt = ($nbAt - [DateTime]::UtcNow).TotalSeconds + 1; if ($wt -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling($wt)) }
+    $nbAt = UT $nbj.notBefore; $wt = ($nbAt - [DateTime]::UtcNow).TotalSeconds + 1; if ($wt -gt 30) { $wt = 30 }; if ($wt -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling($wt)) }
     [void](T submit editor -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'trigger a dispatch pass' -EstMin 1 -NoQuiet)
     $nbj = Wait-Job $nbId @('done', 'failed')
-    Check 'not before: a dispatch pass after its time starts it' ($nbj.state -eq 'done' -and [DateTime]::Parse([string]$nbj.started).ToUniversalTime() -ge $nbAt.AddSeconds(-1))
+    Check 'not before: a dispatch pass after its time starts it' ($nbj.state -eq 'done' -and (UT $nbj.started) -ge $nbAt.AddSeconds(-1))
     Check 'priority: out of range is refused' ((T submit build -By pr -Exe cmd.exe -ArgList '/c exit 0' -Priority 12 -NoQuiet) -eq 1)
     [void](T take build -By prh -EstMin 1)
     [void](T submit build -By prlo -Exe cmd.exe -ArgList '/c exit 0' -For 'low' -EstMin 1 -NoQuiet); $loId = LastId
     [void](T submit build -By prhi -Exe cmd.exe -ArgList '/c exit 0' -For 'high' -EstMin 1 -Priority 5 -NoQuiet); $hiId = LastId
     Check 'priority: a higher one goes ahead in the queue' ($out -match 'queued: build #1 of 2' -and @((Status).queues.build)[0].job -eq $hiId)
     [void](T release build -By prh)
-    $hj = Wait-Job $hiId @('done', 'failed'); $lj = Wait-Job $loId @('done', 'failed') 60
-    Check 'priority: and starts first' ($hj.state -eq 'done' -and $lj.state -eq 'done' -and [DateTime]::Parse([string]$hj.started) -le [DateTime]::Parse([string]$lj.started))
+    [void](T submit editor -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'trigger a dispatch pass' -EstMin 1 -NoQuiet)
+    $hj = Wait-Job $hiId @('done', 'failed')
+    [void](T submit editor -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'trigger a dispatch pass' -EstMin 1 -NoQuiet)
+    $lj = Wait-Job $loId @('done', 'failed')
+    Check 'priority: and starts first' ($hj.state -eq 'done' -and $lj.state -eq 'done' -and (UT $hj.started) -le (UT $lj.started))
     # --- check: what Thor makes of a command before it runs
     $rc = T check -Exe 'C:\UE\Game\Binaries\Win64\UnrealEditor.exe' -ArgList 'Game.uproject -game -log=run.log' -By chk -Json
     $cj = $out | ConvertFrom-Json

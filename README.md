@@ -260,7 +260,7 @@ verb with what is wrong. The board's row tags and some message wording still say
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 297 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 339 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the

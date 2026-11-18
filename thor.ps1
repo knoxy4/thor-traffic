@@ -1241,7 +1241,7 @@ function Preempt-Pass($Leases) {
         Cop-Note ([string]$j.by) "preempted your job $($j.id): $why. It is queued again as $again and starts over when its turn comes."
         $out += @{ job = $j.id; again = $again; lease = $n; why = $why }
     }
-    return , $out
+    return $out
 }
 function Alarm-Pass($Leases) {
     # A holder past its cap that Cap-Pass can't stop, with someone waiting: says so once per cap and stops nothing (header: the cop).
@@ -1454,7 +1454,7 @@ function Cop-Pass($Procs, $Leases) {
                 $sess = '?'; $what = "a busy $($p.kind) daemon with nobody on the $ln lease"
             } else {
                 if (-not (Is-StrikeBuild $p)) { continue }
-                if (($now - $p.started).TotalSeconds -lt $CopGraceSec) { continue }
+                if (($now - (To-Utc $p.started)).TotalSeconds -lt $CopGraceSec) { continue }
                 $sess = Run-Session $p
                 $what = if ($p.cpp) { "a C++ build without the $ln lease" } else { "a $($p.kind) run without the $ln lease" }
             }
