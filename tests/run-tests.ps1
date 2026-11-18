@@ -173,6 +173,19 @@ try {
     [IO.File]::WriteAllText($bf, '{"loaded": 0}'); Start-Sleep -Milliseconds 500
     $ps3 = Probe-Status
     Check 'probe: no answer counts as busy' ((@($ps3.reasons) -join ';') -match 'local LLM loaded: ollama\.exe pid 205')
+    # --- finished jobs older than 30 days are pruned; anything unfinished stays
+    $jd = Join-Path $D 'jobs'; $old = (Get-Date).AddDays(-40)
+    foreach ($fj in @(@{ id = 'old-done'; state = 'done' }, @{ id = 'old-run'; state = 'running' }, @{ id = 'new-done'; state = 'done' })) {
+        $fp = Join-Path $jd "$($fj.id).json"; [IO.File]::WriteAllText($fp, (@{ id = $fj.id; state = $fj.state } | ConvertTo-Json))
+        [IO.File]::WriteAllText((Join-Path $jd "$($fj.id).out.log"), 'x')
+        if ($fj.id -like 'old-*') { (Get-Item $fp).LastWriteTime = $old }
+    }
+    Remove-Item (Join-Path $jd '.pruned') -Force -ErrorAction SilentlyContinue
+    [void](T submit build -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'prune pass' -EstMin 1 -NoQuiet); [void](Wait-Job (LastId) @('done', 'failed'))
+    $script:out = (Get-ChildItem $jd -Name) -join ' '
+    Check 'prune: an old finished job and its logs go' (-not (Test-Path (Join-Path $jd 'old-done.json')) -and -not (Test-Path (Join-Path $jd 'old-done.out.log')))
+    Check 'prune: an old unfinished job and a fresh one stay' ((Test-Path (Join-Path $jd 'old-run.json')) -and (Test-Path (Join-Path $jd 'new-done.json')))
+    Check 'prune: it is logged' ((Get-Content (Join-Path $D 'lease.log') -Raw) -match 'prune jobs - 1 finished jobs older than 30 days')
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
     foreach ($suite in @('quiet-wait', 'cap')) {
         $qp = 0; $qf = 0

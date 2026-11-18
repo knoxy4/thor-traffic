@@ -23,7 +23,8 @@
 #   thor.ps1 cop     [-Every 5] [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]
 #
 # State lives in -Dir (default $env:THOR_DIR, else %ProgramData%\ThorTraffic): leases\<name>.json, queue\<name>.json,
-# jobs\<id>.json and lease.log. Every change happens under one named mutex, so two takes can never both win.
+# jobs\<id>.json and lease.log. Every change happens under one named mutex, so two takes can never both win. A finished job's
+# files are deleted once they are $env:THOR_JOB_DAYS (30) days old; 0 keeps them all.
 #
 # Leases. A lease is a file with an expiry (-Minutes; defaults editor 120, build 60, gpu 30; cap 720) that the holder renews
 # or releases, because an agent's tool call is short-lived and can't hold a mutex. A lease tied to a process (-HolderPid,
@@ -277,6 +278,7 @@ $DefaultMin = @{}; foreach ($n in $Names) { $DefaultMin[$n] = $Traits.leases[$n]
 $LeaseDir = Join-Path $Dir 'leases'
 $QueueDir = Join-Path $Dir 'queue'
 $JobDir = Join-Path $Dir 'jobs'; $JobWaitMin = 240
+$JobKeepDays = 30; if ($env:THOR_JOB_DAYS -as [double]) { $JobKeepDays = [double]$env:THOR_JOB_DAYS }
 $CheckMaxMin = 10; $CheckMinMin = 1; $GraceMin = 5; $OverrunMin = 5; $CapPadMin = 5; $LaneBreakOn = $false
 $LogFile = Join-Path $Dir 'lease.log'
 $Utf8 = New-Object Text.UTF8Encoding $false
@@ -573,6 +575,23 @@ function Set-Job([string]$Id, [hashtable]$Fields, [string[]]$OnlyFrom = @()) {
 function Drop-JobEntry([string]$Name, [string]$RunBy) {
     With-Lock { Write-Queue $Name @(Read-Queue $Name | Where-Object { $_.by -ne $RunBy }) } | Out-Null
 }
+function Prune-Jobs {
+    # A finished job's files (json and logs) go once they are $JobKeepDays old ($env:THOR_JOB_DAYS, default 30; 0 keeps all), so the
+    # folder every dispatch pass lists stays small. At most once an hour per state folder; a job still queued or running stays.
+    if ($JobKeepDays -le 0 -or -not (Test-Path $JobDir)) { return 0 }
+    $mk = Join-Path $JobDir '.pruned'
+    if ((Test-Path -LiteralPath $mk) -and (Get-Item -LiteralPath $mk).LastWriteTimeUtc -gt [DateTime]::UtcNow.AddHours(-1)) { return 0 }
+    [IO.File]::WriteAllText($mk, (Now-Iso), $Utf8)
+    $cut = [DateTime]::UtcNow.AddDays(-$JobKeepDays); $n = 0
+    foreach ($f in @(Get-ChildItem $JobDir -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -lt $cut })) {
+        try { $st = [string]([IO.File]::ReadAllText($f.FullName, $Utf8) | ConvertFrom-Json).state } catch { continue }
+        if ($st -notin @('done', 'failed', 'cancelled', 'expired', 'lost', 'overrun')) { continue }
+        foreach ($x in @('.json', '.log', '.out.log', '.err.log')) { Remove-Item -LiteralPath (Join-Path $JobDir "$($f.BaseName)$x") -Force -ErrorAction SilentlyContinue }
+        $n++
+    }
+    if ($n) { Log-Line "prune jobs - $n finished jobs older than $JobKeepDays days" }
+    return $n
+}
 function Recent-Jobs([int]$Hours = 13) {
     if (-not (Test-Path $JobDir)) { return @() }
     $since = (Get-Date).AddHours(-$Hours)
@@ -653,6 +672,7 @@ function Dispatch-Pass {
     # died and queued jobs that fell out of the queue. The runner is `run -JobId` (waits for a quiet GPU, takes the lease tied to
     # itself, starts the command, releases, records the exit code).
     if (-not (Test-Path $JobDir)) { return @() }
+    try { [void](Prune-Jobs) } catch {}
     $begun = @()
     foreach ($nm in $Names) {
         $go = With-Lock {
