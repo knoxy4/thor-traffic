@@ -155,6 +155,24 @@ try {
     Check 'profiles: the dispatcher hands its profile to the job it starts' ($pj.state -eq 'done' -and $pj.lease -eq 'bench')
     $o = & $Shell -NoProfile -File $thor status -Dir $PD -ProfilePath (Join-Path $PSScriptRoot 'bad-profile.json') 2>&1 | ForEach-Object { "$_" }; $bx = $LASTEXITCODE; $script:out = $o -join "`n"
     Check 'profiles: a bad profile stops with what is wrong' ($bx -eq 1 -and $out -match 'exactly one lease must have "card": true')
+    # --- idle probes: a daemon that is up with nothing loaded is neither noise nor the lease in use
+    $pf = "$D-probe-port.txt"; $bf = "$D-probe-body.txt"; $pp = "$D-probe.json"
+    [IO.File]::WriteAllText($bf, '{"loaded": 0}')
+    $srv = Start-Process $Shell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'probe-server.ps1')`"", '-PortFile', "`"$pf`"", '-BodyFile', "`"$bf`"") -PassThru -WindowStyle Hidden
+    $tEnd = [DateTime]::UtcNow.AddSeconds(20); while (-not (Test-Path $pf) -and [DateTime]::UtcNow -lt $tEnd) { Start-Sleep -Milliseconds 200 }
+    $prof = [IO.File]::ReadAllText($mp) | ConvertFrom-Json
+    $prof.kinds.llm | Add-Member -NotePropertyName idleProbe -NotePropertyValue ([pscustomobject]@{ url = "http://127.0.0.1:$([IO.File]::ReadAllText($pf).Trim())/status"; idle = '"loaded":\s*0\b' })
+    [IO.File]::WriteAllText($pp, ($prof | ConvertTo-Json -Depth 6))
+    function Probe-Status { $o = & $Shell -NoProfile -File $thor status -Json -Dir $PD -ProfilePath $pp -Fixture (Join-Path $PSScriptRoot 'ml-fixture.json') | ConvertFrom-Json; $script:out = $o | ConvertTo-Json -Depth 5; return $o }
+    $ps1 = Probe-Status
+    Check 'probe: a daemon that answers idle is no noise' ((@($ps1.reasons) -join ';') -notmatch 'local LLM loaded' -and @($ps1.procs | Where-Object { $_.pid -eq 205 })[0].idle -eq $true -and (@($ps1.reasons) -join ';') -match 'training run')
+    [IO.File]::WriteAllText($bf, '{"loaded": 1}')
+    $ps2 = Probe-Status
+    Check 'probe: the same daemon with a model loaded is noise' ((@($ps2.reasons) -join ';') -match 'local LLM loaded: ollama\.exe pid 205')
+    try { Stop-Process -Id $srv.Id -Force } catch {}
+    [IO.File]::WriteAllText($bf, '{"loaded": 0}'); Start-Sleep -Milliseconds 500
+    $ps3 = Probe-Status
+    Check 'probe: no answer counts as busy' ((@($ps3.reasons) -join ';') -match 'local LLM loaded: ollama\.exe pid 205')
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
     foreach ($suite in @('quiet-wait', 'cap')) {
         $qp = 0; $qf = 0
@@ -164,7 +182,9 @@ try {
         if ($qx -and -not $qf) { $script:out = "$suite-tests.ps1 stopped before its end"; Check "$suite suite ran to its end" $false }
     }
 } finally {
-    if (-not $Keep) { Start-Sleep -Seconds 1; Remove-Item $D, "$D-demo", "$D-ml" -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($srv) { try { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue } catch {} }
+    if (-not $Keep) { Start-Sleep -Seconds 1
+        Remove-Item $D, "$D-demo", "$D-ml", "$D-probe-port.txt", "$D-probe-body.txt", "$D-probe.json" -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Write-Host ""
 Write-Host "$pass passed, $fail failed" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })

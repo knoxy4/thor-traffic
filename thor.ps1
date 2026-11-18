@@ -174,6 +174,8 @@ $script:BoundKeys = @($PSBoundParameters.Keys)
 # Kind rules, first match wins: name = regex on the process name, cmd = regex on its command line, cpp = it is a C++ build.
 # Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
 #   neverStop = it writes assets, so the overrun cap never stops a job with one in its tree.
+#   idleProbe = @{ url; idle; timeoutMs } for a daemon that stays up with nothing loaded: when the url answers within timeoutMs
+#   (1000) and the answer matches the regex idle, a process of that kind is neither noise nor the lease in use. No answer = busy.
 $Traits = @{
     name = 'unreal'
     leases = [ordered]@{
@@ -240,6 +242,11 @@ function Read-Profile([string]$Path) {
     foreach ($k in @($t.kinds.Keys)) {
         if ($t.kinds[$k] -isnot [Collections.IDictionary]) { & $bad "kind '$k' must be an object" }
         if ($t.kinds[$k].allow -and [string]$t.kinds[$k].allow -notin @('AllowEditor', 'AllowBuild')) { & $bad "kind '$k': allow is AllowEditor or AllowBuild" }
+        $ip = $t.kinds[$k].idleProbe
+        if ($null -ne $ip) {
+            if ($ip -isnot [Collections.IDictionary] -or [string]$ip.url -notmatch '^https?://' -or -not [string]$ip.idle) { & $bad "kind '$k': idleProbe needs a url (http or https) and idle (a regex on the answer)" }
+            try { [void][regex]::new([string]$ip.idle) } catch { & $bad "kind '$k': idleProbe.idle is not a regex" }
+        }
     }
     return $t
 }
@@ -812,6 +819,24 @@ function Short-Cmd([string]$Name, [string]$Cmd) {
     if ($c.Length -gt 110) { $c = $c.Substring(0, 107) + '...' }
     return $c
 }
+$script:ProbeSeen = @{}
+function Probe-Idle([string]$Kind) {
+    # For a kind with an idleProbe in the profile (a daemon that is up with nothing loaded): true only when its status url answers
+    # in time and the answer matches. No answer, a slow one or an error counts as busy. One ask per kind every 2 s.
+    if (-not $Kind) { return $false }
+    $kt = $Traits.kinds[$Kind]; if (-not $kt -or -not $kt.idleProbe) { return $false }
+    $pr = $kt.idleProbe; $c = $script:ProbeSeen[$Kind]
+    if ($c -and ([DateTime]::UtcNow - $c.at).TotalSeconds -lt 2) { return $c.idle }
+    $idle = $false; $ms = if ($pr.timeoutMs) { [Math]::Min(5000, [Math]::Max(100, [int]$pr.timeoutMs)) } else { 1000 }
+    try {
+        $rq = [Net.WebRequest]::Create([string]$pr.url); $rq.Timeout = $ms; $rq.ReadWriteTimeout = $ms; $rq.Proxy = $null
+        $rs = $rq.GetResponse()
+        try { $body = (New-Object IO.StreamReader($rs.GetResponseStream())).ReadToEnd() } finally { $rs.Close() }
+        $idle = [bool]($body -match [string]$pr.idle)
+    } catch {}
+    $script:ProbeSeen[$Kind] = @{ at = [DateTime]::UtcNow; idle = $idle }
+    return $idle
+}
 function Get-Procs {
     if ($Fixture) {
         # Demo/test replay: processes from the fixture, start times relative to now (agoSec).
@@ -832,7 +857,7 @@ function Get-Procs {
             if ($r.cmd -and $c -notmatch $r.cmd) { continue }
             $k = $r.kind; $cpp = [bool]$r.cpp; break
         }
-        if ($k) { [pscustomobject]@{ kind = $k; cpp = $cpp; pid = [int]$p.ProcessId; name = $n; cmd = (Short-Cmd $n $c); full = $c; started = $(if ($p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime() } else { [DateTime]::UtcNow }) } }
+        if ($k) { [pscustomobject]@{ kind = $k; cpp = $cpp; idle = (Probe-Idle $k); pid = [int]$p.ProcessId; name = $n; cmd = (Short-Cmd $n $c); full = $c; started = $(if ($p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime() } else { [DateTime]::UtcNow }) } }
     }
     return @($out)
 }
@@ -852,7 +877,7 @@ function Quiet-Reasons($Gpu, $Procs, $Leases, [int[]]$SkipPids = @()) {
     }
     $allowed = @{ AllowEditor = [bool]$AllowEditor; AllowBuild = [bool]$AllowBuild }
     foreach ($p in $Procs) {
-        if ($SkipPids -contains $p.pid) { continue }
+        if ($SkipPids -contains $p.pid -or $p.idle) { continue }
         $kt = $Traits.kinds[[string]$p.kind]
         if (-not $kt -or -not $kt.noise) { continue }
         if ($kt.allow -and $allowed[$kt.allow]) { continue }
@@ -940,7 +965,7 @@ function Lease-Busy([string]$Name, $L, $Procs) {
     if ($L.childPid -and (Get-Process -Id ([int]$L.childPid) -ErrorAction SilentlyContinue)) { return $true }
     $lt = $Traits.leases[$Name]
     if (-not $lt) { return $true }
-    if (@($Procs | Where-Object { $_.kind -in $lt.busy -or ($_.kind -in $lt.busyCpp -and $_.cpp) }).Count) { return $true }
+    if (@($Procs | Where-Object { -not $_.idle -and ($_.kind -in $lt.busy -or ($_.kind -in $lt.busyCpp -and $_.cpp)) }).Count) { return $true }
     if ($lt.card) { $card = Get-Gpu; return (-not $card) -or $card.util -gt $MaxUtil }
     return $false
 }

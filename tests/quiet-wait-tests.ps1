@@ -284,6 +284,18 @@ try {
     Check 'a game on the box: gpu lease not reaped' ((L gpu).by -eq 'rd')
     Clear-Up gpu rd rw4; Procs ''
 
+    $llm = '[{"kind":"llm","cpp":false,"idle":IDLE,"pid":999992,"name":"ollama.exe","cmd":"x","full":"ollama.exe runner","started":"2026-01-01T00:00:00Z"}]'
+    Procs ($llm.Replace('IDLE', 'false'))
+    Check 'a local LLM is noise for quiet' ((TL quiet) -eq 3 -and $last -match 'local LLM loaded')
+    Stale gpu rp; Waiter gpu rw21; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'a local LLM on the box: gpu lease not reaped' ((L gpu).by -eq 'rp')
+    Clear-Up gpu rp rw21
+    Procs ($llm.Replace('IDLE', 'true'))
+    Check 'the same LLM probed idle is no noise' ((TL quiet) -eq 0)
+    Stale gpu rq; Waiter gpu rw22; Cop @fast; Start-Sleep 2; Cop @fast
+    Check 'and probed idle: gpu lease reaped' (-not (L gpu))
+    TL unqueue gpu -By rw22 | Out-Null; Procs ''
+
     Noisy
     Stale gpu re; Waiter gpu rw5; Cop @fast; Start-Sleep 2; Cop @fast
     Check 'a busy card: gpu lease not reaped' ((L gpu).by -eq 're')

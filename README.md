@@ -159,6 +159,7 @@ trains and serves models: a `gpu` lease, a `build` lease, and a plain `bench` le
 | `rules[]` | first match wins: `kind`, `name` (regex on the process name), optional `cmd` (regex on the command line), optional `cpp` |
 | `kinds.<kind>.noise` | the line `quiet` gives for it, with `{name}`, `{pid}`, `{cmd}`; a kind with no `noise` never makes the GPU noisy |
 | `kinds.<kind>.allow` | `AllowEditor` or `AllowBuild`: the switch that ignores it |
+| `kinds.<kind>.idleProbe` | `{ "url": ..., "idle": <regex>, "timeoutMs": 1000 }` for a daemon that stays up with nothing loaded (a model server, an image-generation queue). When the url answers in time and the answer matches, its process is neither noise for `quiet` nor a reason to keep the lease. No answer counts as busy. |
 | `kinds.<kind>.neverStop` | it writes files that a kill would corrupt, so the cap never stops a job with one in its tree |
 
 Everything on one state folder has to use one profile. The dispatcher hands its own to the jobs it starts; give the cop
@@ -235,7 +236,7 @@ verb with what is wrong. The board's row tags and some message wording still say
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 287 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 294 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the
