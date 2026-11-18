@@ -321,6 +321,35 @@ try {
     Check 'strike: the preset still strikes a C++ build, not a shader worker' ((Said 'strike build 999986 \? \(a C\+\+ build without the build lease; not stopped\)') -eq 1 -and (Said 'strike build 999987') -eq 0)
     Procs ''
 
+    # --- sinks: hooks from the profile and the webhook from the environment get each new lease.log line, once
+    $hf = Join-Path $Work 'hook-out.txt'; $wf = Join-Path $Work 'webhook-in.txt'; $wpf = Join-Path $Work 'webhook-port.txt'; $wbf = Join-Path $Work 'webhook-body.txt'
+    [IO.File]::WriteAllText($wbf, '{}')
+    $wsrv = Start-Process $Shell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'probe-server.ps1')`"", '-PortFile', "`"$wpf`"", '-BodyFile', "`"$wbf`"", '-SaveFile', "`"$wf`"") -PassThru -WindowStyle Hidden
+    $script:bgs += $wsrv
+    [void](Until { Test-Path $wpf } 20)
+    $hp = Join-Path $Work 'hook-profile.json'
+    $hprof = [IO.File]::ReadAllText($sp) | ConvertFrom-Json
+    $hprof | Add-Member -NotePropertyName hooks -NotePropertyValue @([pscustomobject]@{ on = '^(take|release)$'; exe = 'cmd.exe'; args = "/c echo %THOR_EVENT% %THOR_LEASE% %THOR_BY%>> `"$hf`"" })
+    [IO.File]::WriteAllText($hp, ($hprof | ConvertTo-Json -Depth 6))
+    $env:THOR_WEBHOOK_URL = "http://127.0.0.1:$([IO.File]::ReadAllText($wpf).Trim())/hook"; $env:THOR_WEBHOOK_ON = '^take$'
+    function HC { TL cop -Once -ReapAfterMin 0 -ProfilePath $hp | Out-Null }
+    try {
+        TL take gpu -By hold0 -EstMin 5 | Out-Null; TL release gpu -By hold0 | Out-Null
+        HC
+        Check 'sinks: the first pass starts at the end of the log' (-not (Test-Path $hf) -and -not (Test-Path $wf) -and (Test-Path (Join-Path $D 'sinks.pos')))
+        TL take gpu -By hk -EstMin 5 | Out-Null; TL release gpu -By hk | Out-Null
+        HC
+        Check 'sinks: a hook gets the event in its environment' (Until { (Test-Path $hf) -and (Get-Content $hf -Raw) -match 'take gpu hk' -and (Get-Content $hf -Raw) -match 'release gpu hk' } 15)
+        Check 'sinks: the webhook gets the whole line as JSON' (Until { (Test-Path $wf) -and (Get-Content $wf -Raw) -match '"event":"take"' -and (Get-Content $wf -Raw) -match '"by":"hk"' -and (Get-Content $wf -Raw) -match '"line":"' } 15)
+        HC; Start-Sleep 2
+        Check 'sinks: a line goes out once' (([regex]::Matches((Get-Content $hf -Raw), 'take gpu hk')).Count -eq 1 -and ([regex]::Matches((Get-Content $wf -Raw), '"event":"take"')).Count -eq 1)
+        Check 'sinks: THOR_WEBHOOK_ON filters the webhook' ((Get-Content $wf -Raw) -notmatch '"event":"release"')
+        $bp = Join-Path $Work 'bad-hook-profile.json'
+        $hprof | Add-Member -NotePropertyName webhook -NotePropertyValue 'http://example.invalid/x'
+        [IO.File]::WriteAllText($bp, ($hprof | ConvertTo-Json -Depth 6))
+        Check 'sinks: a webhook url in a profile file is refused' ((TL status -ProfilePath $bp) -eq 1 -and $last -match 'THOR_WEBHOOK_URL only')
+    } finally { $env:THOR_WEBHOOK_URL = $null; $env:THOR_WEBHOOK_ON = $null; try { Stop-Process -Id $wsrv.Id -Force -ErrorAction SilentlyContinue } catch {} }
+
     Noisy
     Stale gpu re; Waiter gpu rw5; Cop @fast; Start-Sleep 2; Cop @fast
     Check 'a busy card: gpu lease not reaped' ((L gpu).by -eq 're')

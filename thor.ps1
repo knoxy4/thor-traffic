@@ -20,7 +20,7 @@
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
 #   thor.ps1 quiet   [-By <who>] [-Wait] [-TimeoutMin 30] [-SettleSec 20] [-MaxVramGB 3.5] [-MaxUtil 50] [-AllowEditor] [-AllowBuild]
 #   thor.ps1 watch   [-Every 5] [-NoCop] [-Plain] [-Once] [-NoToast] [-Frame -Cols 150 -Rows 50] [-Fixture <demo.json>]
-#   thor.ps1 cop     [-Every 5] [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]
+#   thor.ps1 cop     [-Every 5] [-Once] [-Toast] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]
 #
 # State lives in -Dir (default $env:THOR_DIR, else %ProgramData%\ThorTraffic): leases\<name>.json, queue\<name>.json,
 # jobs\<id>.json and lease.log. Every change happens under one named mutex, so two takes can never both win. A finished job's
@@ -108,6 +108,11 @@
 # quits, t toggles alerts.
 # -Frame prints one coloured frame and exits (docs, CI). -Fixture replays fake processes and GPU readings (demo, tests).
 #
+# Sinks. The cop hands every new lease.log line to the profile's hooks (each { on, exe, args }: exe starts detached, with the
+# event in THOR_AT, THOR_EVENT, THOR_LEASE, THOR_BY, THOR_TEXT and THOR_LINE), to $env:THOR_WEBHOOK_URL as a JSON POST (only
+# events matching $env:THOR_WEBHOOK_ON, if set; the url is never read from a file), and with cop -Toast to a Windows toast.
+# <Dir>\sinks.pos keeps its place; failures go to <Dir>\sinks.err.log.
+#
 # Profiles. The leases and the process kinds are a table, and the one built in is the Unreal preset. A profile file replaces it:
 # -ProfilePath <file>, else $env:THOR_PROFILE, else thor.profile.json beside this script; the word builtin as either forces the
 # preset. profiles\unreal.json is the preset as a file, and the comment above $Traits says what each trait does. Everything on
@@ -150,6 +155,7 @@ param(
     [switch]$CopLenient,
     [switch]$CopWait,
     [switch]$NoToast,
+    [switch]$Toast,
     [int]$TrafficEvery = 30,
     [string]$TrafficScript = '',
     [switch]$NoTraffic,
@@ -177,6 +183,7 @@ $script:BoundKeys = @($PSBoundParameters.Keys)
 # Kind rules, first match wins: name = regex on the process name, cmd = regex on its command line, cpp = it is a C++ build.
 # Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
 #   neverStop = it writes assets, so the overrun cap never stops a job with one in its tree.
+# hooks (a file only) = @( @{ on = regex on a lease.log event; exe; args } ): the cop starts exe for each matching line (see Sinks).
 #   idleProbe = @{ url; idle; timeoutMs } for a daemon that stays up with nothing loaded: when the url answers within timeoutMs
 #   (1000) and the answer matches the regex idle, a process of that kind is neither noise nor the lease in use. No answer = busy.
 $Traits = @{
@@ -251,6 +258,16 @@ function Read-Profile([string]$Path) {
             try { [void][regex]::new([string]$ip.idle) } catch { & $bad "kind '$k': idleProbe.idle is not a regex" }
         }
     }
+    foreach ($w in @('webhook', 'webhookUrl', 'url')) { if ($t.Contains($w)) { & $bad "a webhook url lives in `$env:THOR_WEBHOOK_URL only, never in a file (it often carries a token)" } }
+    if ($null -eq $t.hooks) { $t.hooks = @() }
+    if ($t.hooks -is [Collections.IDictionary]) { & $bad '"hooks" must be an array' }
+    $i = 0
+    foreach ($h in @($t.hooks)) {
+        $i++
+        if ($h -isnot [Collections.IDictionary] -or -not [string]$h.on -or -not [string]$h.exe) { & $bad "hook $i needs on (a regex on the lease.log event) and exe (what to start)" }
+        try { [void][regex]::new([string]$h.on) } catch { & $bad "hook $i`: on is not a regex" }
+        foreach ($w in @($h.Keys)) { if ($w -notin @('on', 'exe', 'args')) { & $bad "hook $i`: unknown field '$w' (on, exe, args)" } }
+    }
     return $t
 }
 # Which profile: -ProfilePath, else $env:THOR_PROFILE, else thor.profile.json beside this script. The word builtin keeps the preset above.
@@ -266,6 +283,7 @@ foreach ($n in @($Traits.leases.Keys)) {
     foreach ($f in @('busy', 'busyCpp', 'covers', 'strike', 'enforce')) { $lt[$f] = @($lt[$f] | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
 }
 foreach ($r in @($Traits.rules)) { if ([string]$r.name -eq '{GameExe}') { $r.name = $GameExe } }
+$Hooks = @($Traits.hooks | Where-Object { $_ })
 $Names = @($Traits.leases.Keys)
 if ($Lease) {
     $known = [string]($Names | Where-Object { $_ -eq $Lease } | Select-Object -First 1)
@@ -1392,6 +1410,63 @@ function Build-Groups($Procs, $Cov) {
     }
     return , $out
 }
+function Sink-Err([string]$Msg) { try { [IO.File]::AppendAllText((Join-Path $Dir 'sinks.err.log'), "$(Now-Iso) $Msg`r`n", $Utf8) } catch {} }
+function Run-Hook($H, $Ev) {
+    # A hook starts detached and windowless, and inherits none of the cop's handles. The event reaches it only as environment
+    # (THOR_AT, THOR_EVENT, THOR_LEASE, THOR_BY, THOR_TEXT, THOR_LINE), never spliced into its command line.
+    $vars = @($Ev.Keys | ForEach-Object { 'THOR_' + $_.ToUpper() }); $was = @{}
+    foreach ($k in @($Ev.Keys)) { $nm = 'THOR_' + $k.ToUpper(); $was[$nm] = [Environment]::GetEnvironmentVariable($nm); [Environment]::SetEnvironmentVariable($nm, [string]$Ev[$k]) }
+    try {
+        $sp = @{ FilePath = [string]$H.exe; WindowStyle = 'Hidden' }
+        if ([string]$H.args) { $sp.ArgumentList = [string]$H.args }
+        Start-Process @sp
+    } catch { Sink-Err "hook $($H.exe): $($_.Exception.Message)" }
+    finally { foreach ($nm in $vars) { [Environment]::SetEnvironmentVariable($nm, $was[$nm]) } }
+}
+function Post-Hook([string]$Url, $Ev) {
+    # One POST of the whole event as JSON, 3 s at most, so a dead endpoint costs the cop a pass and nothing else. The line carries
+    # command lines and local paths: that is why the url lives in the environment and on no disk.
+    try {
+        $body = $Utf8.GetBytes(([pscustomobject]$Ev | ConvertTo-Json -Compress))
+        $rq = [Net.WebRequest]::Create($Url); $rq.Method = 'POST'; $rq.ContentType = 'application/json'; $rq.Timeout = 3000; $rq.ReadWriteTimeout = 3000
+        $st = $rq.GetRequestStream(); try { $st.Write($body, 0, $body.Length) } finally { $st.Close() }
+        $rs = $rq.GetResponse(); $rs.Close()
+    } catch { Sink-Err "webhook: $($_.Exception.Message)" }
+}
+function Sink-Pass {
+    # Hands each new lease.log line to the profile's hooks, to $env:THOR_WEBHOOK_URL (filtered by $env:THOR_WEBHOOK_ON, a regex on
+    # the event) and, under cop -Toast, to a toast. Only a cop runs it, one at a time. sinks.pos keeps its place across cop restarts;
+    # the first pass on a state folder starts at the log's end, so nothing old floods out. Sink failures go to sinks.err.log, not
+    # lease.log, which feeds the sinks.
+    $wh = [string]$env:THOR_WEBHOOK_URL
+    if (-not $Hooks.Count -and -not $wh -and -not $Toast) { return 0 }
+    if (-not (Test-Path -LiteralPath $LogFile)) { return 0 }
+    $pf = Join-Path $Dir 'sinks.pos'; $len = (Get-Item -LiteralPath $LogFile).Length
+    $raw = if (Test-Path -LiteralPath $pf) { ([IO.File]::ReadAllText($pf)).Trim() } else { '' }
+    $pos = if ($raw -match '^\d+$') { [long]$raw } else { -1 }
+    if ($pos -lt 0 -or $pos -gt $len) { $pos = $len }
+    if ($pos -eq $len) { if ($raw -ne [string]$len) { [IO.File]::WriteAllText($pf, [string]$len) }; return 0 }
+    $buf = New-Object byte[] ([int]($len - $pos)); $got = 0
+    $fs = [IO.File]::Open($LogFile, 'Open', 'Read', 'ReadWrite')
+    try { [void]$fs.Seek($pos, 'Begin'); while ($got -lt $buf.Length) { $r = $fs.Read($buf, $got, $buf.Length - $got); if ($r -le 0) { break }; $got += $r } } finally { $fs.Dispose() }
+    $txt = $Utf8.GetString($buf, 0, $got); $cut = $txt.LastIndexOf("`n")
+    if ($cut -lt 0) { return 0 }
+    $txt = $txt.Substring(0, $cut + 1)
+    [IO.File]::WriteAllText($pf, [string]($pos + $Utf8.GetByteCount($txt)))
+    $n = 0; $toasts = @()
+    foreach ($ln in ($txt -split "`r?`n")) {
+        if ($ln -notmatch '^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$') { continue }
+        $ev = [ordered]@{ at = $Matches[1]; event = $Matches[2]; lease = $Matches[3]; by = $Matches[4]; text = $Matches[5]; line = $ln }
+        foreach ($h in $Hooks) { if ($ev.event -match [string]$h.on) { Run-Hook $h $ev; $n++ } }
+        if ($wh -and (-not $env:THOR_WEBHOOK_ON -or $ev.event -match $env:THOR_WEBHOOK_ON)) { Post-Hook $wh $ev; $n++ }
+        if ($Toast -and ($ev.event -match '^(cop-kill|strike|lapse|dequeue|dispatch|job-|over-cap|reestimate|reap|park-long)' -or $ln -match ' forced')) { $toasts += Short "$($ev.event) $($ev.lease) $($ev.by) $($ev.text)" 160 }
+    }
+    if ($toasts.Count) {
+        $title = if ($toasts.Count -gt 1) { "THOR traffic: $($toasts.Count) changes" } else { 'THOR traffic' }
+        Show-Toast $title @(@($toasts[0]) + @(if ($toasts.Count -gt 1) { ($toasts | Select-Object -Skip 1) -join ' | ' }))
+    }
+    return $n
+}
 function Board-Model {
     $m = @{ now = [DateTime]::UtcNow }
     $m.gpu = Get-Gpu 2; $m.procs = Get-Procs; $m.leases = Get-Leases
@@ -1403,6 +1478,7 @@ function Board-Model {
     if ($script:CopOn) { try { if (@(Cap-Pass $m.leases).Count) { $m.leases = Get-Leases; $m.procs = Get-Procs } } catch {} }
     if ($script:CopOn) { try { if (@(Alarm-Pass $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
     if ($script:CopOn) { try { if ((Dispatch-Pass).Count) { $m.leases = Get-Leases } } catch {} }
+    if ($script:CopOn) { try { [void](Sink-Pass) } catch {} }
     $m.cov = Coverage $m.procs $m.leases
     $m.reasons = Quiet-Reasons $m.gpu $m.procs $m.leases
     $m.queues = @{}; foreach ($n in $Names) { $m.queues[$n] = @(Status-Queue $n $m.leases[$n]) }
@@ -2001,6 +2077,7 @@ switch ($Verb) {
             try { foreach ($cj in (Cap-Pass (Get-Leases))) { Say "$(if ($cj.stopped) { 'stopped' } else { 'over its cap, not stopped:' }) job $($cj.job): $($cj.why)" Red } } catch { Say "cap pass failed: $($_.Exception.Message)" Yellow }
             try { foreach ($ca in (Alarm-Pass (Get-Leases))) { Say "over its cap, not stopped: $($ca.by)'s $($ca.lease) lease$(if ($ca.job) { " (job $($ca.job))" }): $($ca.why)" Red } } catch { Say "alarm pass failed: $($_.Exception.Message)" Yellow }
             try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)$(if ($dj.lease -eq $CardLease) { " (cap ~$(Local-Hm (Job-CapAt $dj)))" })" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
+            try { [void](Sink-Pass) } catch { Say "sink pass failed: $($_.Exception.Message)" Yellow }
             if ($Once) { exit 0 }
             Start-Sleep -Seconds ([Math]::Max(2, $Every))
         }
