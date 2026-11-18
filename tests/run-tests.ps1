@@ -192,6 +192,46 @@ try {
     [void](T release build -By prh)
     $hj = Wait-Job $hiId @('done', 'failed'); $lj = Wait-Job $loId @('done', 'failed') 60
     Check 'priority: and starts first' ($hj.state -eq 'done' -and $lj.state -eq 'done' -and [DateTime]::Parse([string]$hj.started) -le [DateTime]::Parse([string]$lj.started))
+    # --- check: what Thor makes of a command before it runs
+    $rc = T check -Exe 'C:\UE\Game\Binaries\Win64\UnrealEditor.exe' -ArgList 'Game.uproject -game -log=run.log' -By chk -Json
+    $cj = $out | ConvertFrom-Json
+    Check 'check: an agent -game run without the gpu lease is take first (exit 2)' ($rc -eq 2 -and $cj.kind -eq 'game' -and $cj.verdict -eq 'take first' -and @($cj.leases | Where-Object { $_.lease -eq 'gpu' -and $_.without -eq 'stopped' }).Count -eq 1 -and $cj.agentMarker)
+    [void](T take gpu -By chk -EstMin 5)
+    $rc = T check -Exe 'UnrealEditor.exe' -ArgList 'Game.uproject -game' -By chk
+    Check 'check: with the lease held it is go (exit 0)' ($rc -eq 0 -and $out -match 'gpu: without it the cop stops it when an agent runs it; now yours \(chk\)' -and $out -match 'go')
+    [void](T release gpu -By chk)
+    $rc = T check -Exe 'UnrealBuildTool.exe' -ArgList 'Game Win64 Development' -By chk -Json; $cj = $out | ConvertFrom-Json
+    Check 'check: a C++ build is struck without the build lease' ($rc -eq 2 -and $cj.kind -eq 'build' -and $cj.cpp -and @($cj.leases | Where-Object { $_.lease -eq 'build' -and $_.without -eq 'struck' }).Count -eq 1)
+    $rc = T check -Exe 'notepad.exe' -By chk
+    Check 'check: something no rule knows is go' ($rc -eq 0 -and $out -match 'no kind')
+    # --- the MCP wrapper: JSON-RPC on stdio, one line per message
+    $mi = [Diagnostics.ProcessStartInfo]::new((Get-Command $Shell).Source, "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $root 'mcp\thor-mcp.ps1')`" -Dir `"$D`"")
+    $mi.UseShellExecute = $false; $mi.RedirectStandardInput = $true; $mi.RedirectStandardOutput = $true; $mi.CreateNoWindow = $true
+    $mcp = [Diagnostics.Process]::Start($mi)
+    function Rpc([string]$Line) {
+        $mcp.StandardInput.WriteLine($Line); $mcp.StandardInput.Flush()
+        $t = $mcp.StandardOutput.ReadLineAsync(); if (-not $t.Wait(60000)) { return $null }
+        $script:out = $t.Result; return ($t.Result | ConvertFrom-Json)
+    }
+    try {
+        $r = Rpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'
+        Check 'mcp: initialize answers with tools and the asked protocol' ($r.id -eq 1 -and $r.result.protocolVersion -eq '2025-06-18' -and $null -ne $r.result.capabilities.tools)
+        $mcp.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+        $r = Rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+        $tn = @($r.result.tools | ForEach-Object { $_.name })
+        Check 'mcp: tools/list has the verbs' ($r.id -eq 2 -and $tn -contains 'thor_take' -and $tn -contains 'thor_submit' -and $tn -contains 'thor_check' -and @($r.result.tools | Where-Object { $_.name -eq 'thor_take' })[0].inputSchema.required -contains 'by')
+        $r = Rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"thor_take","arguments":{"lease":"gpu","by":"mcp1","estMin":5,"for":"through mcp"}}}'
+        Check 'mcp: thor_take takes the lease' ($r.id -eq 3 -and -not $r.result.isError -and $r.result.content[0].text -match '^exit 0' -and (Status).leases.gpu.lease.by -eq 'mcp1')
+        $r = Rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"thor_status","arguments":{}}}'
+        $sj = ($r.result.content[0].text -replace '^exit \d+\s*', '') | ConvertFrom-Json
+        Check 'mcp: thor_status returns status JSON' ($sj.leases.gpu.lease.by -eq 'mcp1' -and $sj.leases.gpu.lease.note -eq 'through mcp')
+        $r = Rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"thor_release","arguments":{"lease":"gpu"}}}'
+        Check 'mcp: a missing argument is an error, and nothing runs' ($r.result.isError -and $r.result.content[0].text -match 'missing argument: by' -and (Status).leases.gpu.lease.by -eq 'mcp1')
+        $r = Rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"thor_release","arguments":{"lease":"gpu","by":"mcp1"}}}'
+        Check 'mcp: thor_release gives it back' (-not $r.result.isError -and (Status).leases.gpu.state -eq 'none')
+        $r = Rpc '{"jsonrpc":"2.0","id":7,"method":"nope"}'
+        Check 'mcp: an unknown method is refused' ($r.id -eq 7 -and $r.error.code -eq -32601)
+    } finally { try { $mcp.StandardInput.Close(); if (-not $mcp.WaitForExit(5000)) { $mcp.Kill() } } catch {} }
     # --- finished jobs older than 30 days are pruned; anything unfinished stays
     $jd = Join-Path $D 'jobs'; $old = (Get-Date).AddDays(-40)
     foreach ($fj in @(@{ id = 'old-done'; state = 'done' }, @{ id = 'old-run'; state = 'running' }, @{ id = 'new-done'; state = 'done' })) {

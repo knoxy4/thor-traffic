@@ -16,6 +16,7 @@
 #                    (+ quiet's switches)
 #   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
 #   thor.ps1 stats   [-Days 14] [-By <who>] [-Json]
+#   thor.ps1 check   -Exe <path> [-ArgList '<args>'] [-By <who>] [-Json]
 #   every verb: [-Dir <state folder>] [-ProfilePath <profile.json>]
 #   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
@@ -126,9 +127,14 @@
 # preset. profiles\unreal.json is the preset as a file, and the comment above $Traits says what each trait does. Everything on
 # one state folder must use one profile: the dispatcher hands its own to the jobs it starts, the cop and the board need the same.
 #
+# Check. Before an agent launches something: check -Exe <path> -ArgList '<args>' -By <who> says what kind the profile's rules see
+# it as and, per lease, what happens without it (the cop stops it, logs a strike, or counts it as the lease in use) and whether
+# <who> or one of its jobs holds it. Exit 2 when a lease it would be stopped or struck without isn't theirs (take it first),
+# else 0. mcp\thor-mcp.ps1 serves the verbs, check included, as MCP tools on stdio.
+#
 # Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first), 3 not quiet.
 param(
-    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats')][string]$Verb,
+    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats', 'check')][string]$Verb,
     [Parameter(Position = 1)][string]$Lease,
     [string]$By,
     [string]$For = '',
@@ -2322,6 +2328,46 @@ switch ($Verb) {
         # lease keeps the wait: it's what keeps a build job off an open editor.
         if ($Lease -eq $CardLease -and -not @($script:BoundKeys | Where-Object { $_ -in @('Quiet', 'AllowEditor', 'AllowBuild', 'MaxVramGB', 'MaxUtil', 'SettleSec') }).Count) { $NoQuiet = $true }
         Do-Submit
+    }
+    'check' {
+        if (-not $Exe) { Fail 'check needs -Exe <path> (and -ArgList for its arguments)' }
+        $leaf = $Exe; try { $leaf = [IO.Path]::GetFileName($Exe) } catch {}
+        $full = "$Exe $ArgList".Trim(); $ck = $null; $ccpp = $false
+        foreach ($r in $Traits.rules) {
+            if (-not $r.name -or $leaf -notmatch $r.name) { continue }
+            if ($r.cmd -and $full -notmatch $r.cmd) { continue }
+            $ck = [string]$r.kind; $ccpp = [bool]$r.cpp; break
+        }
+        $who = if ($By) { $By.Trim().ToLower() } else { '' }
+        $ls = Get-Leases; $needs = @()
+        foreach ($n in $Names) {
+            if (-not $ck) { break }
+            $lt = $Traits.leases[$n]
+            $how = if ($ck -in @($lt.enforce)) { 'stopped' }
+                   elseif ($ck -in @($lt.strike) -and ($ck -notin @($lt.busyCpp) -or $ccpp)) { 'struck' }
+                   elseif ($ck -in @($lt.busy) -or $ck -in @($lt.covers) -or ($ccpp -and $ck -in @($lt.busyCpp))) { 'in use' } else { '' }
+            if (-not $how) { continue }
+            $hb = if ($ls[$n].state -eq 'live') { [string]$ls[$n].lease.by } else { '' }
+            $yours = [bool]($who -and $hb -and ($hb -eq $who -or $hb -like "$who.*"))
+            $needs += [pscustomobject][ordered]@{ lease = $n; without = $how; holder = $hb; yours = $yours }
+        }
+        $missing = @($needs | Where-Object { -not $_.yours -and $_.without -in @('stopped', 'struck') })
+        $verdict = if (-not $ck) { 'no kind' } elseif ($missing.Count) { 'take first' } else { 'go' }
+        $rc = if ($missing.Count) { 2 } else { 0 }
+        if ($Json) {
+            [pscustomobject][ordered]@{ exe = $Exe; args = $ArgList; kind = $ck; cpp = $ccpp; agentMarker = (Is-AgentRun $full); profile = [string]$Traits.name; leases = @($needs); verdict = $verdict } | ConvertTo-Json -Depth 4
+            exit $rc
+        }
+        if (-not $ck) { Say "$leaf is no kind this profile ($($Traits.name)) knows: no lease covers it and the cop ignores it" Green; exit 0 }
+        Say "$leaf is a $ck$(if ($ccpp) { ' (C++ build)' }) to this profile ($($Traits.name))"
+        foreach ($nd in $needs) {
+            $what = switch ($nd.without) { 'stopped' { 'the cop stops it when an agent runs it' } 'struck' { 'the cop logs it as a strike' } default { 'it counts as the lease in use' } }
+            $held = if ($nd.yours) { "yours ($($nd.holder))" } elseif ($nd.holder) { "held by $($nd.holder)" } else { 'free' }
+            Say "  $($nd.lease): without it $what; now $held" $(if ($nd.yours -or $nd.without -eq 'in use') { 'Gray' } else { 'Yellow' })
+        }
+        if ($missing.Count) { Say "take first: $(@($missing | ForEach-Object { "thor.ps1 take $($_.lease) -By $(if ($who) { $who } else { '<who>' })" }) -join '; '), or hand the command to submit" Yellow }
+        else { Say 'go' Green }
+        exit $rc
     }
     'stats' {
         $root = if ($By) { Lane-Root ($By.Trim().ToLower()) } else { '' }

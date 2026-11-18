@@ -32,10 +32,13 @@ One PowerShell file. No server, no service account, no database: state is a fold
 | 🚀 **A dispatcher** | `submit` queues the *launch command itself*. When the lease frees, Thor starts it — no polling, no dead air between jobs. Exit code and stdout/stderr are kept for the agent to read later. |
 | ⏱️ **Re-estimates** | Running long? `renew -EstMin <minutes left>` moves your estimate, and everyone queued behind you gets the new time. |
 | 🤫 **Quiet-GPU gate** | Timed runs (fps, load times, frame costs) wait until the card is actually idle: no other lease, VRAM and load under a threshold, no editor, no shader compiles, no local LLM. They wait from the queue holding nothing, so a noisy card never blocks work that doesn't need it quiet. `run` and `hold` wait by default; a `gpu` job asks with `-Quiet`. |
-| 👮 **The cop** | Stops agent `-game`/packaged runs the gpu lease doesn't cover (after a 45 s grace) and tells the agent why in its own log. C++ builds without the build lease are logged as strikes, never killed. A lease left past its estimate with nothing running goes back once someone's waiting. Your own launches are never touched. |
+| 👮 **The cop** | Stops agent `-game`/packaged runs the gpu lease doesn't cover (after a 45 s grace) and tells the agent why in its own log. C++ builds without the build lease are logged as strikes, never killed, and a profile can name more strike kinds per lease, a busy model daemon included. A lease left past its estimate with nothing running goes back once someone's waiting. Your own launches are never touched. |
 | 🧩 **Profiles** | The leases and the process kinds are a JSON table, not code. Keep the Unreal preset, start from `profiles\ml.json`, or write your own. |
 | 💤 **Idle probes** | A model server that stays up with nothing loaded isn't noise: Thor asks its status URL and believes the answer. No answer counts as busy. |
 | 📊 **Stats** | `stats` shows what jobs took against what they said they'd take, and `submit` flags an estimate that history says is too short. |
+| 🔔 **Sinks** | The cop hands every lease.log line to your hooks (any command, the event in `THOR_*` env vars), to a webhook, and with `cop -Toast` to Windows toasts, so alerts don't need a board open. |
+| 🕓 **Later and first** | `submit -NotBefore 02:00` queues a job for tonight without holding anyone up; `-Priority` puts urgent work ahead; a `-Preemptible` job steps aside for it and goes back in line. |
+| 🛂 **Check and MCP** | `check` tells an agent, before it launches something, which lease that command needs and whether it holds it. `mcp\thor-mcp.ps1` serves the verbs as MCP tools on stdio. |
 | 📺 **The board** | Live, colour terminal view with a 90-minute timeline, strikes, and Windows toast alerts when leases change hands, jobs finish or the GPU goes quiet. |
 
 ## Quick start
@@ -162,12 +165,13 @@ trains and serves models: a `gpu` lease, a `build` lease, and a plain `bench` le
 | `leases.<name>.busy`, `busyCpp` | process kinds that count as the lease in use, so the cop doesn't take it back (`busyCpp`: only rules marked `cpp`) |
 | `leases.<name>.covers` | kinds a live lease covers without a pid tie |
 | `leases.<name>.enforce` | on the card lease: kinds the cop stops when an agent runs one uncovered |
-| `leases.<name>.strike` | kinds logged as a strike when a `cpp` one runs without the lease |
+| `leases.<name>.strike` | kinds the cop logs as a strike, never stops, when an agent runs one without the lease (a kind also in `busyCpp`: only its `cpp` builds). A kind with an `idleProbe` is a daemon: struck while busy with nobody on the lease, again after each idle spell |
 | `rules[]` | first match wins: `kind`, `name` (regex on the process name), optional `cmd` (regex on the command line), optional `cpp` |
 | `kinds.<kind>.noise` | the line `quiet` gives for it, with `{name}`, `{pid}`, `{cmd}`; a kind with no `noise` never makes the GPU noisy |
 | `kinds.<kind>.allow` | `AllowEditor` or `AllowBuild`: the switch that ignores it |
 | `kinds.<kind>.idleProbe` | `{ "url": ..., "idle": <regex>, "timeoutMs": 1000 }` for a daemon that stays up with nothing loaded (a model server, an image-generation queue). When the url answers in time and the answer matches, its process is neither noise for `quiet` nor a reason to keep the lease. No answer counts as busy. |
 | `kinds.<kind>.neverStop` | it writes files that a kill would corrupt, so the cap never stops a job with one in its tree |
+| `hooks[]` | `{ "on": <regex on the lease.log event>, "exe": ..., "args": ... }`: the cop starts `exe` detached for each matching line, with the event in `THOR_AT`, `THOR_EVENT`, `THOR_LEASE`, `THOR_BY`, `THOR_TEXT` and `THOR_LINE`, never in its command line. A webhook url is refused here: it goes in `THOR_WEBHOOK_URL` |
 
 Everything on one state folder has to use one profile. The dispatcher hands its own to the jobs it starts; give the cop
 and the board the same one, or put `thor.profile.json` beside `thor.ps1` and they all find it. A bad profile stops every
@@ -182,14 +186,15 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times and the cap. Never shortens. |
 | `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line who can use it. `-Force` only for a holder that's gone. |
 | `unqueue <lease> -By <who>` | Leave a queue. |
-| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. |
+| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-NotBefore] [-Priority] [-Preemptible] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. `-NotBefore +<min>` or a time holds it back without holding the lease for it. `-Priority 0-9` orders the queue (higher first). A running `-Preemptible` job is stopped and queued again when a job of higher priority is first in line. |
+| `check -Exe <path> [-ArgList] [-By <who>] [-Json]` | Before a launch: the kind the profile sees, and per lease whether the cop would stop it, strike it or count it as the lease in use, and whether `<who>` holds it. Exit 2 when a lease it needs isn't theirs. |
 | `job [-JobId <id>] [-By <who>] [-Json] [-Cancel]` | A job's state, exit code and output tail, or the job list. `-Cancel` kills the tree. |
 | `stats [-Days 14] [-By <who>] [-Json]` | What jobs took against what they said: per kind of job, the median estimate, the median run, how many ran late, and the median wait. `submit` uses the same history: an estimate far under what jobs like it took gets an `estimate check` line (and `estimateHint` with `-Json`). |
 | `run -By <who> -Exe <path> [-ArgList] [-Lease gpu] [-NoQuiet]` | Wait in line, wait for quiet, take the lease, run, release, return the exit code. Waits for quiet on any lease unless `-NoQuiet`. |
 | `& hold [lease] -By <who> [-NoQuiet]` | For launcher scripts: take the lease tied to the calling process. Waits for quiet on `gpu` only. |
 | `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20] [-AllowEditor] [-AllowBuild]` | Is the GPU quiet? Exit 3 if not. `run`, `hold` and `submit` take the same switches. |
 | `watch [-Every 5] [-NoCop] [-NoToast] [-Plain] [-Frame -Cols -Rows] [-Fixture]` | The live board (and the cop). `-Frame` prints one frame and exits. |
-| `cop [-Once] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]` | The enforcer + dispatcher without the board. `-CopDryRun` only says what it would stop, release or log; `-CopMatch` limits it to matching command lines (for a holder with no job, its `-By` and `-For`); `-ReapAfterMin 0` keeps abandoned leases. |
+| `cop [-Once] [-Toast] [-CopDryRun] [-CopLenient] [-CopWait] [-CopMatch <regex>] [-ReapAfterMin 10]` | The enforcer + dispatcher without the board. `-CopDryRun` only says what it would stop, release or log; `-CopMatch` limits it to matching command lines (for a holder with no job, its `-By` and `-For`); `-ReapAfterMin 0` keeps abandoned leases. `-Toast` toasts lease.log events from the headless cop. It also runs the sinks: hooks, the webhook. |
 
 ### Job states
 
@@ -204,6 +209,7 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `expired` | It left the queue unstarted, past `-TimeoutMin` or unqueued. |
 | `lost` | Its runner died without reporting: killed, or the box restarted. |
 | `overrun` | The cop stopped it at its cap, with someone queued. Submit it again with a true estimate. |
+| `preempted` | The cop stopped it for a job of higher priority. It was queued again as a new job under the same name; `why` names it. |
 
 ## Configuration
 
@@ -214,6 +220,8 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `THOR_GAME_EXE` / `-GameExe` | `-Win64-(Shipping\|Development\|Test\|DebugGame).exe$` | regex for your packaged game's process name |
 | `THOR_AGENT_MARKERS` | — | extra regex that marks a command line as an agent's |
 | `THOR_SCRATCH` / `-ScratchDir` | — | per-agent folders; the cop drops `THOR_COP.txt` in `<dir>\<who>\` when it stops a run or job, releases a lease or raises the alarm. For all but a stopped run, `<who>` is the `-By` root, so `ci.art0` reads `<dir>\ci\` |
+| `THOR_WEBHOOK_URL` | — | the cop POSTs every lease.log line here as JSON (`at`, `event`, `lease`, `by`, `text`, `line`). Environment only, never a file |
+| `THOR_WEBHOOK_ON` | — | regex on the event: only matching lines go to the webhook (e.g. `^(cop-kill\|strike\|job-)`) |
 | `THOR_JOB_DAYS` | `30` | days a finished job's json and logs are kept; `0` keeps them all |
 | `-ReapAfterMin` | `10` | minutes a lease stays idle past its estimate, with someone waiting, before the cop releases it; `0` turns that off |
 | `-ParkWarnMin` | `15` | minutes a wait for quiet runs before it logs `park-long`; then hourly |
@@ -241,6 +249,12 @@ verb with what is wrong. The board's row tags and some message wording still say
 - **VRAM is a card total** — Windows (WDDM) doesn't report video memory per process.
 - **Profiles are young.** The suite runs a non-Unreal profile's leases, kinds, jobs and probes, but the board's row tags and
   some messages still say `gpu` and `editor`.
+- **The webhook gets everything in the line.** Command lines and lease notes carry local paths, your user folder among them,
+  and all of it goes to whoever runs the endpoint. Filter with `THOR_WEBHOOK_ON`, and point it at something you trust.
+- **`thor_submit` over MCP runs any command it is handed**, the same as `submit`. It's stdio only, so it reaches only agents
+  you already start, but give it only to agents you'd let run commands anyway.
+- **`-NotBefore` needs a dispatch pass.** A job whose time has come starts on the next cop or board pass, or the next submit.
+  With neither running, it waits.
 - **One user.** Agents and the human run as the same Windows user; the state folder isn't an ACL boundary.
 
 ## Tests

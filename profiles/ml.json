@@ -9,7 +9,10 @@
         "imagegen",
         "train"
       ],
-      "enforce": []
+      "enforce": [],
+      "strike": [
+        "train"
+      ]
     },
     "build": {
       "minutes": 60,
