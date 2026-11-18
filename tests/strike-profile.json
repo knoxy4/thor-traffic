@@ -1,0 +1,17 @@
+{
+  "name": "strike-test",
+  "leases": {
+    "gpu": { "minutes": 30, "card": true, "busy": ["llm", "train"], "enforce": [], "strike": ["train", "llm"] },
+    "build": { "minutes": 60, "busyCpp": ["compile"], "covers": ["compile"], "strike": ["compile"] }
+  },
+  "rules": [
+    { "kind": "llm", "name": "(?i)^ollama\\.exe$" },
+    { "kind": "train", "name": "(?i)^python\\.exe$" },
+    { "kind": "compile", "name": "(?i)^cl\\.exe$", "cpp": true }
+  ],
+  "kinds": {
+    "llm": { "noise": "local LLM loaded: {name} pid {pid}", "idleProbe": { "url": "http://127.0.0.1:9/status", "idle": "idle" } },
+    "train": { "noise": "training run: {name} pid {pid}" },
+    "compile": { "noise": "compile work: {name} pid {pid}" }
+  }
+}

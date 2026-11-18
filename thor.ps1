@@ -79,7 +79,8 @@
 #   - a stop is logged (cop-kill) and the reason + the fix are appended to the run's -abslog file and, with -ScratchDir,
 #     to <ScratchDir>\<who>\THOR_COP.txt, where the agent will see it;
 #   - a C++ build (UBT/UAT) without the build lease is logged as a strike, never stopped (a killed link can corrupt
-#     binaries for everyone);
+#     binaries for everyone). A profile names what else is struck, per lease: an agent's run of a strike kind without the
+#     lease, or a probed daemon busy while nobody holds it. Strikes are only logged; what is stopped stays the card lease's enforce list;
 #   - it releases abandoned leases. A lease past its estimate with nothing of its kind running (editor: an editor or commandlet;
 #     build: UBT, UAT or a commandlet; gpu: a game, packaged run, local LLM or image generation, or the card over -MaxUtil; any
 #     lease: the command run started) gets idleSince on its file. Still idle after -ReapAfterMin (10) with someone in its queue,
@@ -169,8 +170,9 @@ $script:BoundKeys = @($PSBoundParameters.Keys)
 # ---- the profile: leases and process kinds as data (this one is the Unreal preset; a file can replace it) -----------------
 # The code below asks this table what a lease is and what a process is.
 # Lease traits: minutes = default expiry. busy = process kinds that count as the lease in use; busyCpp = kinds that count only
-#   when they are a C++ build. covers = kinds a live lease covers without a pid tie. strike = kinds logged as a strike when a
-#   C++ one runs without the lease. card = the one lease the GPU reading gates: an agent's uncovered `enforce` kinds are stopped,
+#   when they are a C++ build. covers = kinds a live lease covers without a pid tie. strike = kinds the cop logs as a strike, never stops,
+#   when an agent's one runs without the lease (a kind also in busyCpp: only its C++ builds); a kind with an idleProbe is a daemon
+#   whose callers can't be traced, so it is struck once per busy spell while nobody holds the lease. card = the one lease the GPU reading gates: an agent's uncovered `enforce` kinds are stopped,
 #   its jobs are capped, hold waits for quiet on it, a job on it asks for quiet, and it is the lease a verb takes by default.
 # Kind rules, first match wins: name = regex on the process name, cmd = regex on its command line, cpp = it is a C++ build.
 # Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
@@ -1322,16 +1324,30 @@ function Cop-Pass($Procs, $Leases) {
         Log-Line "cop-kill gpu $($p.pid) $sess ($why): $($p.cmd)"; $out.killed += $p
         Start-Sleep -Milliseconds 300; Tell-Agent $p $sess $why
     }
-    # C++ builds (UBT/UAT) without the build lease: a strike in lease.log, once per process, never stopped (a killed link
-    # can leave broken binaries for everyone). cargo locks its own target dir, so it needs no lease.
-    foreach ($p in @($mine | Where-Object { $_.kind -in $StrikeKinds -and $_.cpp })) {
-        if ($cov.ContainsKey($p.pid) -or $script:Struck.ContainsKey($p.pid)) { continue }
-        if (-not (Is-StrikeBuild $p)) { continue }
-        if (($now - $p.started).TotalSeconds -lt $CopGraceSec) { continue }
-        $sess = Run-Session $p
-        if ($CopDryRun) { Say "would log a strike: pid $($p.pid) [$sess] C++ build without the build lease: $($p.cmd)" Yellow; continue }
-        $script:Struck[$p.pid] = 1
-        Log-Line "strike build $($p.pid) $sess (a C++ build without the build lease; not stopped): $($p.name) $($p.cmd)"; $out.struck += $p
+    # Strikes: a lease's strike kinds running without it go in lease.log, once per process, and are never stopped (a killed link
+    # can leave broken binaries for everyone). A kind in busyCpp counts only as a C++ build: cargo locks its own target dir.
+    # A probed daemon works for whoever calls it over http, so it is struck while busy with nobody on the lease, again after
+    # each idle spell.
+    foreach ($ln in $Names) {
+        $lt = $Traits.leases[$ln]; $sk = @($lt.strike)
+        if (-not $sk.Count) { continue }
+        foreach ($p in @($mine | Where-Object { $_.kind -in $sk -and ($_.kind -notin @($lt.busyCpp) -or $_.cpp) })) {
+            $key = "$ln/$($p.pid)"; $daemon = [bool]$Traits.kinds[[string]$p.kind].idleProbe
+            if ($daemon -and $p.idle) { $script:Struck.Remove($key); continue }
+            if ($cov.ContainsKey($p.pid) -or $script:Struck.ContainsKey($key)) { continue }
+            if ($daemon) {
+                if ($Leases[$ln].state -eq 'live') { continue }
+                $sess = '?'; $what = "a busy $($p.kind) daemon with nobody on the $ln lease"
+            } else {
+                if (-not (Is-StrikeBuild $p)) { continue }
+                if (($now - $p.started).TotalSeconds -lt $CopGraceSec) { continue }
+                $sess = Run-Session $p
+                $what = if ($p.cpp) { "a C++ build without the $ln lease" } else { "a $($p.kind) run without the $ln lease" }
+            }
+            if ($CopDryRun) { Say "would log a strike: pid $($p.pid) [$sess] $($what): $($p.cmd)" Yellow; continue }
+            $script:Struck[$key] = 1
+            Log-Line "strike $ln $($p.pid) $sess ($what; not stopped): $($p.name) $($p.cmd)"; $out.struck += $p
+        }
     }
     return $out
 }
