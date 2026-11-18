@@ -1,19 +1,19 @@
 # run-tests.ps1 - end-to-end tests for thor.ps1 in a throwaway state dir. Needs no GPU: jobs run with -NoQuiet, the board is
-# rendered from demo\fixture.json, and quiet-wait-tests.ps1 stubs the GPU. Usage: pwsh tests\run-tests.ps1 [-Keep]
-param([switch]$Keep)
+# rendered from demo\fixture.json, and quiet-wait-tests.ps1 stubs the GPU. Usage: pwsh tests\run-tests.ps1 [-Shell pwsh|powershell] [-Keep]
+param([string]$Shell = 'pwsh', [switch]$Keep)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $thor = Join-Path $root 'thor.ps1'
 $D = Join-Path ([IO.Path]::GetTempPath()) ("thor-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 $pass = 0; $fail = 0
-function T { $o = & pwsh -NoProfile -ExecutionPolicy Bypass -File $thor @args -Dir $D 2>&1 | ForEach-Object { "$_" }; $script:out = $o -join "`n"; return $LASTEXITCODE }
+function T { $o = & $Shell -NoProfile -ExecutionPolicy Bypass -File $thor @args -Dir $D 2>&1 | ForEach-Object { "$_" }; $script:out = $o -join "`n"; return $LASTEXITCODE }
 function Check([string]$Name, [bool]$Cond) {
     if ($Cond) { $script:pass++; Write-Host "PASS $Name" -ForegroundColor Green }
     else { $script:fail++; Write-Host "FAIL $Name" -ForegroundColor Red; Write-Host ($script:out -split "`n" | Select-Object -First 15 | Out-String) }
 }
-function Status { (& pwsh -NoProfile -File $thor status -Json -Dir $D | ConvertFrom-Json) }
-function Job([string]$Id) { (& pwsh -NoProfile -File $thor job -JobId $Id -Json -Dir $D | ConvertFrom-Json) }
-function Jobs([string]$By) { @(& pwsh -NoProfile -File $thor job -By $By -Json -Dir $D | ConvertFrom-Json) }
+function Status { (& $Shell -NoProfile -File $thor status -Json -Dir $D | ConvertFrom-Json) }
+function Job([string]$Id) { (& $Shell -NoProfile -File $thor job -JobId $Id -Json -Dir $D | ConvertFrom-Json) }
+function Jobs([string]$By) { @(& $Shell -NoProfile -File $thor job -By $By -Json -Dir $D | ConvertFrom-Json) }
 function Wait-Job([string]$Id, [string[]]$States, [int]$Sec = 40) {
     $t = [DateTime]::UtcNow.AddSeconds($Sec)
     while ([DateTime]::UtcNow -lt $t) { $j = Job $Id; if ([string]$j.state -in $States) { return $j }; Start-Sleep -Milliseconds 700 }
@@ -77,10 +77,24 @@ try {
     $st = (Status).leases.build
     $script:out = "build lease: $($st.state), by $($st.lease.by)"
     Check 'cancelled: the lease is free' ($st.state -ne 'live')
+    # --- a waiter whose job already ended leaves the queue (left in place it blocks everyone behind it with the lease free)
+    [void](T take gpu -By holder -EstMin 1)
+    [void](T submit gpu -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'ends in the queue' -EstMin 1)
+    $dead = Job (LastId)
+    Check 'a take behind the queued job waits (exit 2)' ($dead.state -eq 'queued' -and (T take gpu -By next -EstMin 1) -eq 2)
+    # The job ends with its entry still queued, as when whatever ended it died before the dequeue.
+    $jf = Join-Path $D "jobs\$($dead.id).json"
+    [IO.File]::WriteAllText($jf, ([IO.File]::ReadAllText($jf) -replace '"state":\s*"queued"', '"state": "expired"'))
+    Check 'ended job: release keeps the lease for the waiter behind it' ((T release gpu -By holder) -eq 0 -and $out -match 'kept for next')
+    Check 'ended job: the waiter behind it takes the lease' ((T take gpu -By next -EstMin 1) -eq 0)
+    $script:out = Get-Content -Raw (Join-Path $D 'lease.log')
+    Check 'ended job: its entry is dequeued and logged' ($out -match "dequeue gpu $([regex]::Escape($dead.runBy)) \(job expired\)" -and -not @((Status).queues.gpu | Where-Object { $_.job }).Count)
+    Check 'ended job: it never started' ((Job $dead.id).state -eq 'expired')
+    [void](T release gpu -By next)
     # --- board: one frame from the demo fixture
     $DD = "$D-demo"
-    & pwsh -NoProfile -File (Join-Path $root 'demo\seed.ps1') -Dir $DD | Out-Null
-    $frame = & pwsh -NoProfile -File $thor watch -Frame -Cols 150 -Rows 50 -Dir $DD -Fixture (Join-Path $root 'demo\fixture.json') | Out-String
+    & $Shell -NoProfile -File (Join-Path $root 'demo\seed.ps1') -Dir $DD | Out-Null
+    $frame = & $Shell -NoProfile -File $thor watch -Frame -Cols 150 -Rows 50 -Dir $DD -Fixture (Join-Path $root 'demo\fixture.json') | Out-String
     $plain = $frame -replace "\x1b\[[0-9;?]*[A-Za-z]", ''
     Check 'board frame renders' ($plain -match 'THOR TRAFFIC' -and $plain -match 'NEXT 90 MIN')
     Check 'board tags the uncovered run NO LEASE' ($plain -match 'NO LEASE')
@@ -88,7 +102,7 @@ try {
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
     foreach ($suite in @('quiet-wait', 'cap')) {
         $qp = 0; $qf = 0
-        & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "$suite-tests.ps1") | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
+        & $Shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "$suite-tests.ps1") -Shell $Shell | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
         $qx = $LASTEXITCODE
         $pass += $qp; $fail += $qf
         if ($qx -and -not $qf) { $script:out = "$suite-tests.ps1 stopped before its end"; Check "$suite suite ran to its end" $false }

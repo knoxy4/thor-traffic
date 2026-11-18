@@ -267,12 +267,21 @@ function Write-Queue([string]$Name, $Entries) {
     [IO.File]::WriteAllText($p, (@{ entries = $list } | ConvertTo-Json -Depth 5), $Utf8)
 }
 function Live-Queue([string]$Name, [string]$HolderBy, [switch]$Log) {
-    # Drops no-shows (past their check-back plus grace), waiters whose process ended, and the holder itself.
+    # Drops no-shows (past their check-back plus grace), waiters whose process ended, waiters whose job already ended, and the holder itself.
     $now = [DateTime]::UtcNow; $keep = @()
     foreach ($e in (Read-Queue $Name | Sort-Object { (To-Utc $_.joined).Ticks }, { [string]$_.by })) {
         $why = $null
         if ((To-Utc $e.until) -le $now) { $why = 'no-show' }
         elseif ($e.pid) { $st = Pid-Stamp ([int]$e.pid); if ($null -eq $st -or ($e.pidStart -and $st -and $st -ne [string]$e.pidStart)) { $why = 'process ended' } }
+        if (-not $why -and $e.job) {
+            # A job's waiter outlives its job when the job ends without taking the lease (expired, cancelled, lost):
+            # left in place it blocks every waiter behind it with the lease free.
+            $jp = Join-Path $JobDir "$($e.job).json"
+            if (Test-Path -LiteralPath $jp) {
+                try { $js = [string]([IO.File]::ReadAllText($jp, $Utf8) | ConvertFrom-Json).state } catch { $js = '' }
+                if ($js -in @('expired', 'cancelled', 'failed', 'lost', 'done', 'overrun')) { $why = "job $js" }
+            }
+        }
         if (-not $why -and $HolderBy -and $e.by -eq $HolderBy) { $why = 'holds it now' }
         if ($why) { if ($Log -and $why -ne 'holds it now') { Log-Line "dequeue $Name $($e.by) ($why)" }; continue }
         $keep += $e

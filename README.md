@@ -202,14 +202,14 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 266 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 271 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the
 process list in a copy of `thor.ps1`, on its own mutexes, so it can move the card from noisy to quiet under a waiter that's
 already running, hold the lock on purpose and never stall a live queue. It also includes `tests\cap-tests.ps1`, which uses real
 runners and real process trees in the same kind of copy, with the cap's pad cut to 0.1 min so a cap falls in seconds.
-Run either alone with `-Shell powershell` to check it under Windows PowerShell 5.1.
+Add `-Shell powershell`, to the whole suite or to either of those alone, to check it under Windows PowerShell 5.1.
 
 ---
 
