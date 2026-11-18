@@ -10,7 +10,7 @@ $Pad = 0.1
 $Work = Join-Path ([IO.Path]::GetTempPath()) ("thor-cap-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 $D = Join-Path $Work 'state'
 $scr = Join-Path $Work 'scratch'
-New-Item -ItemType Directory -Force $D, (Join-Path $scr 'cap'), (Join-Path $scr 'al'), (Join-Path $scr 'off') | Out-Null
+New-Item -ItemType Directory -Force $D, (Join-Path $scr 'cap'), (Join-Path $scr 'al'), (Join-Path $scr 'off'), (Join-Path $scr 'pre') | Out-Null
 $env:THOR_SCRATCH = $scr
 $tlOn = Join-Path $Work 'thor_stub_on.ps1'; $tlOff = Join-Path $Work 'thor_stub_off.ps1'
 $tl = $tlOn
@@ -472,6 +472,26 @@ try {
     Cop
     Check 'and the cop leaves it and says nothing' ((L gpu).by -eq 'noeta' -and (Said 'over-cap gpu noeta') -eq 0)
     TL unqueue gpu -By noeta2 | Out-Null; TL release gpu -By noeta | Out-Null
+    # --- preemption: a running -Preemptible job gives way to a higher priority, and only that
+    $p1 = Submit editor -By pre.lo -Exe cmd.exe -ArgList $tree -For 'preemptible' -EstMin 5 -Preemptible
+    Check 'preempt: the preemptible job runs' (Until { Runs $p1.id } 20)
+    $p2 = Submit editor -By pre.hi -Exe cmd.exe -ArgList $ok -For 'urgent' -EstMin 0.01 -Priority 5
+    TL cop -Once -ReapAfterMin 0 -CopDryRun | Out-Null
+    Check 'preempt: -CopDryRun only says it' ($last -match "would preempt job $([regex]::Escape($p1.id))" -and (Job $p1.id).state -eq 'running')
+    Cop
+    Check 'preempt: the cop stops it for a higher priority' ((Job $p1.id).state -eq 'preempted' -and (Said "job-preempt editor pre\.lo\.j1 job $([regex]::Escape($p1.id))") -eq 1)
+    Check 'preempt: its tree is gone' (Until { -not (Alive ([int](Job $p1.id).childPid)) } 10)
+    Check 'preempt: the urgent job runs and ends' (Until { Pass; (Job $p2.id).state -eq 'done' } 30)
+    $again = @(Get-ChildItem (Join-Path $D 'jobs') -Filter 'pre.lo.j1-*.json' | ForEach-Object { Job $_.BaseName } | Where-Object { $_.id -ne $p1.id }) | Select-Object -First 1
+    Check 'preempt: it is queued again under its name and runs' ($again -and $again.preempts -eq 1 -and (Until { Pass; Runs $again.id } 25))
+    Check 'preempt: its owner is told' ((Note 'pre') -match 'preempted your job')
+    Tidy $again.id; Free 'editor'
+    $p4 = Submit editor -By pre.keep -Exe cmd.exe -ArgList $tree -For 'not preemptible' -EstMin 5
+    Check 'preempt: a plain job runs' (Until { Runs $p4.id } 20)
+    $p5 = Submit editor -By pre.hi3 -Exe cmd.exe -ArgList $ok -For 'urgent' -EstMin 0.01 -Priority 9
+    Cop; Start-Sleep 2
+    Check 'preempt: a job without -Preemptible is never stopped for priority' ((Job $p4.id).state -eq 'running')
+    Tidy $p4.id; Tidy $p5.id; Free 'editor'
 } catch {
     $script:fail++; Write-Host "FAIL the suite stopped: $($_.Exception.Message)" -ForegroundColor Red
 } finally {

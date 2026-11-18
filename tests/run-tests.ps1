@@ -173,6 +173,25 @@ try {
     [IO.File]::WriteAllText($bf, '{"loaded": 0}'); Start-Sleep -Milliseconds 500
     $ps3 = Probe-Status
     Check 'probe: no answer counts as busy' ((@($ps3.reasons) -join ';') -match 'local LLM loaded: ollama\.exe pid 205')
+    # --- -NotBefore: a job nobody waits for until its time; -Priority: higher goes first
+    Check 'not before: a time already past is refused' ((T submit build -By nb -Exe cmd.exe -ArgList '/c exit 0' -NotBefore '2020-01-01 00:00' -NoQuiet) -eq 1 -and $out -match 'already passed')
+    Check 'not before: a job held back queues on a free lease' ((T submit build -By nb -Exe cmd.exe -ArgList '/c exit 0' -For 'later' -EstMin 1 -NotBefore '+0.25' -NoQuiet) -eq 0 -and $out -match 'held back until')
+    $nbId = LastId; $nbj = Job $nbId
+    Check 'not before: it stays queued and the job says when' ($nbj.state -eq 'queued' -and $nbj.notBefore -and @((Status).queues.build)[0].notBefore)
+    Check 'not before: the lease is not kept for it' ((T take build -By nbx -NoQueue) -eq 0)
+    [void](T release build -By nbx)
+    $nbAt = [DateTime]::Parse([string]$nbj.notBefore).ToUniversalTime(); $wt = ($nbAt - [DateTime]::UtcNow).TotalSeconds + 1; if ($wt -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling($wt)) }
+    [void](T submit editor -By ci -Exe cmd.exe -ArgList '/c exit 0' -For 'trigger a dispatch pass' -EstMin 1 -NoQuiet)
+    $nbj = Wait-Job $nbId @('done', 'failed')
+    Check 'not before: a dispatch pass after its time starts it' ($nbj.state -eq 'done' -and [DateTime]::Parse([string]$nbj.started).ToUniversalTime() -ge $nbAt.AddSeconds(-1))
+    Check 'priority: out of range is refused' ((T submit build -By pr -Exe cmd.exe -ArgList '/c exit 0' -Priority 12 -NoQuiet) -eq 1)
+    [void](T take build -By prh -EstMin 1)
+    [void](T submit build -By prlo -Exe cmd.exe -ArgList '/c exit 0' -For 'low' -EstMin 1 -NoQuiet); $loId = LastId
+    [void](T submit build -By prhi -Exe cmd.exe -ArgList '/c exit 0' -For 'high' -EstMin 1 -Priority 5 -NoQuiet); $hiId = LastId
+    Check 'priority: a higher one goes ahead in the queue' ($out -match 'queued: build #1 of 2' -and @((Status).queues.build)[0].job -eq $hiId)
+    [void](T release build -By prh)
+    $hj = Wait-Job $hiId @('done', 'failed'); $lj = Wait-Job $loId @('done', 'failed') 60
+    Check 'priority: and starts first' ($hj.state -eq 'done' -and $lj.state -eq 'done' -and [DateTime]::Parse([string]$hj.started) -le [DateTime]::Parse([string]$lj.started))
     # --- finished jobs older than 30 days are pruned; anything unfinished stays
     $jd = Join-Path $D 'jobs'; $old = (Get-Date).AddDays(-40)
     foreach ($fj in @(@{ id = 'old-done'; state = 'done' }, @{ id = 'old-run'; state = 'running' }, @{ id = 'new-done'; state = 'done' })) {

@@ -12,7 +12,8 @@
 #   thor.ps1 release <lease> -By <who> [-Force]
 #   thor.ps1 unqueue <lease> -By <who>
 #   thor.ps1 submit  [gpu|editor|build] -By <who> -Exe <path> [-ArgList '<args>'] [-WorkDir <dir>] [-For 'what'] [-EstMin 20]
-#                    [-Quiet] [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
+#                    [-Quiet] [-NoQuiet] [-TimeoutMin 240] [-NotBefore <+min | time>] [-Priority 0-9] [-Preemptible] [-Json]
+#                    (+ quiet's switches)
 #   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
 #   thor.ps1 stats   [-Days 14] [-By <who>] [-Json]
 #   every verb: [-Dir <state folder>] [-ProfilePath <profile.json>]
@@ -57,7 +58,14 @@
 # -MaxUtil and -SettleSec), take the lease tied to that runner, start -Exe in -WorkDir with stdout and
 # stderr to <id>.out.log / <id>.err.log, release, record the exit code. States: queued, starting (its runner is up, and may
 # be waiting for quiet: the waiting field says why), running, done, failed, cancelled, expired (never started within
-# -TimeoutMin), lost (runner killed), overrun (stopped at its cap: see the cop). Read a job back with job -JobId <id> -Json.
+# -TimeoutMin), lost (runner killed), overrun (stopped at its cap: see the cop), preempted (stopped for a higher priority and queued again). Read a job back with job -JobId <id> -Json.
+#
+# Later and first. submit -NotBefore +<minutes> or a time (21:30 is the next 21:30; at most 7 days out) queues a job that nobody
+# waits for until then: the lease isn't kept for it, and its -TimeoutMin counts from that time. A dispatch pass starts it after,
+# so something must run one (the cop, a watch window, any submit). -Priority 0-9 (0) orders a queue: higher first, then who came
+# first; plain waiters are 0. A running job submitted -Preemptible gives way when a job of higher priority is first in its lease's
+# queue: the cop stops it (state preempted, job-preempt in lease.log, a note) and queues it again under the same name, first among
+# its priority. A job that isn't -Preemptible is never stopped for priority.
 #
 # Quiet GPU. For anything timed: no other holder's gpu lease, under -MaxVramGB of video memory in use, the GPU under
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
@@ -169,7 +177,10 @@ param(
     [int]$Cols = 150,
     [int]$Rows = 50,
     [string]$Fixture = '',
-    [string]$ProfilePath = ''
+    [string]$ProfilePath = '',
+    [string]$NotBefore = '',
+    [int]$Priority = 0,
+    [switch]$Preemptible
 )
 $ErrorActionPreference = 'Stop'
 $script:BoundKeys = @($PSBoundParameters.Keys)
@@ -403,10 +414,14 @@ function Write-Queue([string]$Name, $Entries) {
     if ($list.Count -eq 0) { Remove-Item $p -Force -ErrorAction SilentlyContinue; return }
     [IO.File]::WriteAllText($p, (@{ entries = $list } | ConvertTo-Json -Depth 5), $Utf8)
 }
+function Sort-Queue($Entries) {
+    # Queue order: higher -Priority first, then who joined first.
+    return , @(@($Entries) | Where-Object { $_ } | Sort-Object { -[int]$_.prio }, { (To-Utc $_.joined).Ticks }, { [string]$_.by })
+}
 function Live-Queue([string]$Name, [string]$HolderBy, [switch]$Log) {
     # Drops no-shows (past their check-back plus grace), waiters whose process ended, waiters whose job already ended, and the holder itself.
     $now = [DateTime]::UtcNow; $keep = @()
-    foreach ($e in (Read-Queue $Name | Sort-Object { (To-Utc $_.joined).Ticks }, { [string]$_.by })) {
+    foreach ($e in (Sort-Queue (Read-Queue $Name))) {
         $why = $null
         if ((To-Utc $e.until) -le $now) { $why = 'no-show' }
         elseif ($e.pid) { $st = Pid-Stamp ([int]$e.pid); if ($null -eq $st -or ($e.pidStart -and $st -and $st -ne [string]$e.pidStart)) { $why = 'process ended' } }
@@ -416,7 +431,7 @@ function Live-Queue([string]$Name, [string]$HolderBy, [switch]$Log) {
             $jp = Join-Path $JobDir "$($e.job).json"
             if (Test-Path -LiteralPath $jp) {
                 try { $js = [string]([IO.File]::ReadAllText($jp, $Utf8) | ConvertFrom-Json).state } catch { $js = '' }
-                if ($js -in @('expired', 'cancelled', 'failed', 'lost', 'done', 'overrun')) { $why = "job $js" }
+                if ($js -in @('expired', 'cancelled', 'failed', 'lost', 'done', 'overrun', 'preempted')) { $why = "job $js" }
             }
         }
         if (-not $why -and $HolderBy -and $e.by -eq $HolderBy) { $why = 'holds it now' }
@@ -427,8 +442,9 @@ function Live-Queue([string]$Name, [string]$HolderBy, [switch]$Log) {
 }
 function Queue-First($Q) {
     # Who a free lease is kept for: the first waiter that could use it now (header: Standing aside).
-    $quietAhead = @()
+    $quietAhead = @(); $now = [DateTime]::UtcNow
     foreach ($e in @($Q)) {
+        if ($e.notBefore -and (To-Utc $e.notBefore) -gt $now) { continue }
         if ($e.parked) { $quietAhead += [string]$e.quietKey; continue }
         if ($e.needQuiet -and $quietAhead -contains [string]$e.quietKey) { continue }
         return $e
@@ -454,8 +470,13 @@ function Free-At($L, [string]$State) {
 }
 function Plan-Queue($Entries, [DateTime]$FreeAt) {
     # Each waiter's expected start: when the holder is done plus the estimates of everyone ahead.
+    # A job held back by -NotBefore starts at that time at the earliest, and the others go on in the gap.
     $t = $FreeAt; $out = @()
-    foreach ($e in $Entries) { $out += [pscustomobject]@{ e = $e; start = $t }; $t = $t.AddMinutes([double]$e.est) }
+    foreach ($e in $Entries) {
+        $nb = if ($e.notBefore) { To-Utc $e.notBefore } else { $null }
+        if ($nb -and $nb -gt $t) { $out += [pscustomobject]@{ e = $e; start = $nb }; continue }
+        $out += [pscustomobject]@{ e = $e; start = $t }; $t = $t.AddMinutes([double]$e.est)
+    }
     return , $out
 }
 function Check-Back([DateTime]$Start) {
@@ -605,7 +626,7 @@ function Prune-Jobs {
     $cut = [DateTime]::UtcNow.AddDays(-$JobKeepDays); $n = 0
     foreach ($f in @(Get-ChildItem $JobDir -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -lt $cut })) {
         try { $st = [string]([IO.File]::ReadAllText($f.FullName, $Utf8) | ConvertFrom-Json).state } catch { continue }
-        if ($st -notin @('done', 'failed', 'cancelled', 'expired', 'lost', 'overrun')) { continue }
+        if ($st -notin @('done', 'failed', 'cancelled', 'expired', 'lost', 'overrun', 'preempted')) { continue }
         foreach ($x in @('.json', '.log', '.out.log', '.err.log')) { Remove-Item -LiteralPath (Join-Path $JobDir "$($f.BaseName)$x") -Force -ErrorAction SilentlyContinue }
         $n++
     }
@@ -618,7 +639,22 @@ function Recent-Jobs([int]$Hours = 13) {
     return @(Get-ChildItem $JobDir -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since } |
         Sort-Object LastWriteTime | ForEach-Object { try { [IO.File]::ReadAllText($_.FullName, $Utf8) | ConvertFrom-Json } catch {} } | Where-Object { $_ })
 }
+function Parse-When([string]$S) {
+    # -NotBefore: +<minutes> from now, or a time (local unless it says otherwise). A bare 21:30 that has passed means tomorrow's.
+    $now = [DateTime]::UtcNow
+    if ($S -match '^\+(\d+(\.\d+)?)$') { $t = $now.AddMinutes([double]$Matches[1]) }
+    else {
+        try { $t = [DateTime]::Parse($S, [Globalization.CultureInfo]::CurrentCulture, [Globalization.DateTimeStyles]::AssumeLocal).ToUniversalTime() }
+        catch { Fail "-NotBefore '$S' is not a time: give +<minutes>, or a time like 21:30 or 2026-11-19 02:00" }
+        if ($S -match '^\d{1,2}:\d\d$' -and $t -le $now) { $t = $t.AddDays(1) }
+    }
+    if ($t -le $now) { Fail "-NotBefore $S has already passed" }
+    if ($t -gt $now.AddDays(7)) { Fail '-NotBefore is at most 7 days out' }
+    return $t
+}
 function Do-Submit {
+    if ($Priority -lt 0 -or $Priority -gt 9) { Fail '-Priority is 0 to 9 (higher goes first)' }
+    $nb = if ($NotBefore) { Parse-When $NotBefore } else { $null }
     $exePath = $Exe
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         $gc = Get-Command $Exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -648,17 +684,19 @@ function Do-Submit {
             id = $id; by = $By; runBy = $runBy; lease = $Lease; note = $For; est = $est
             exe = $exePath; args = $ArgList; cwd = $cwd; noQuiet = [bool]$NoQuiet; timeoutMin = $tmo
             allowEditor = [bool]$AllowEditor; allowBuild = [bool]$AllowBuild; maxVramGB = $MaxVramGB; maxUtil = $MaxUtil; settleSec = $SettleSec
+            prio = $Priority; preemptible = [bool]$Preemptible; notBefore = $(if ($nb) { Iso $nb } else { $null })
             state = 'queued'; why = ''; submitted = Iso $now; started = $null; took = $null; ended = $null; exit = $null; runPid = $null; childPid = $null
             log = (Join-Path $JobDir "$id.log"); out = (Join-Path $JobDir "$id.out.log"); err = (Join-Path $JobDir "$id.err.log")
         }
         Write-Job $job
         # Its queue place never needs a check-back: the dispatcher starts it. It drops out only after -TimeoutMin of waiting.
-        $me = [pscustomobject][ordered]@{ by = $runBy; note = $For; est = $est; joined = IsoFine $now; nextCheck = Iso $now.AddMinutes($tmo); until = Iso $now.AddMinutes($tmo); pid = $null; pidStart = $null; job = $id; needQuiet = -not [bool]$NoQuiet; parked = ''; quietKey = (Quiet-Key) }
-        $list = @(@($q) + @($me))
+        $from = if ($nb) { $nb } else { $now }
+        $me = [pscustomobject][ordered]@{ by = $runBy; note = $For; est = $est; joined = IsoFine $now; nextCheck = Iso $from.AddMinutes($tmo); until = Iso $from.AddMinutes($tmo); pid = $null; pidStart = $null; job = $id; needQuiet = -not [bool]$NoQuiet; parked = ''; quietKey = (Quiet-Key); prio = $Priority; notBefore = $(if ($nb) { Iso $nb } else { $null }) }
+        $list = Sort-Queue (@($q) + @($me))
         Write-Queue $Lease $list
         $plan = Plan-Queue $list (Free-At $cur $state)
-        $pos = $list.Count; $start = $plan[$pos - 1].start
-        Log-Line "submit $Lease $runBy #$pos est $est min, expects $(Iso $start) job $id$(if ($For) { " for: $For" })"
+        $pos = 1; for ($k = 0; $k -lt $list.Count; $k++) { if ($list[$k].by -eq $runBy) { $pos = $k + 1 } }; $start = $plan[$pos - 1].start
+        Log-Line "submit $Lease $runBy #$pos est $est min, expects $(Iso $start) job $id$(if ($Priority) { " priority $Priority" })$(if ($Preemptible) { ' preemptible' })$(if ($nb) { " not before $(Iso $nb)" })$(if ($For) { " for: $For" })"
         return @{ id = $id; runBy = $runBy; pos = $pos; total = $list.Count; start = $start; holder = $holder }
     }
     [void](Dispatch-Pass)
@@ -673,14 +711,17 @@ function Do-Submit {
     } catch {}
     if ($Json) { if ($hint) { $j | Add-Member -NotePropertyName estimateHint -NotePropertyValue $hint -Force }; $j | ConvertTo-Json -Depth 4; exit 0 }
     if ($j.state -eq 'queued') {
-        $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
-        Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
+        $ahead = if ($res.holder) { "held by $($res.holder)" } elseif ($nb) { 'free' } else { 'free, but behind the queue' }
+        $held = if ($nb) { "held back until $(Local-Hm $nb), then " } else { '' }
+        Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); $($held)expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
+        if ($nb) { Say 'a dispatch pass starts it once its time comes: keep the cop (or a watch window) running' }
     } else { Say "job $($res.id): $Lease was free; $($j.state) now" Green }
     if ($Lease -eq $CardLease) {
         $capT = $(if ($j.state -eq 'queued') { $res.start } else { [DateTime]::UtcNow }).AddMinutes((Cap-Span $est))
         Say "its cap falls about $(Local-Hm $capT), $(Cap-Span $est) min after it starts (2 x est + $CapPadMin). Past that with someone waiting, the cop stops it$(if ($LaneBreakOn) { " and cancels its lane's queued jobs" }); renew gpu -By $($res.runBy) -EstMin <n> moves it."
     }
     if ($Lease -eq $CardLease -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
+    if ($Preemptible) { Say "it is preemptible: a job of priority above $Priority, first in the $Lease queue, makes the cop stop it and queue it again" }
     if ($hint) { Say "estimate check: $hint." Yellow }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
@@ -1147,6 +1188,55 @@ function Cap-Pass($Leases) {
     $out += @{ job = $j.id; by = $L.by; stopped = $true; why = "$over$(if ($gone) { "; cancelled $gone" })" }
     return $out
 }
+function Requeue-Job($J) {
+    # A preempted job's second go: a fresh job file with the same command and switches under the same name, first among its priority.
+    return With-Lock {
+        $now = [DateTime]::UtcNow; $n = [string]$J.lease
+        $id = "$($J.runBy)-$($now.ToLocalTime().ToString('MMdd-HHmmss'))"
+        $nj = $J | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+        $fresh = [ordered]@{ id = $id; state = 'queued'; why = "queued again after preemption (was $($J.id))"; submitted = Iso $now; started = $null; took = $null; ended = $null
+            exit = $null; runPid = $null; childPid = $null; waiting = ''; notBefore = $null; preempts = [int]$J.preempts + 1
+            log = (Join-Path $JobDir "$id.log"); out = (Join-Path $JobDir "$id.out.log"); err = (Join-Path $JobDir "$id.err.log") }
+        foreach ($k in $fresh.Keys) { $nj | Add-Member -NotePropertyName $k -NotePropertyValue $fresh[$k] -Force }
+        Write-Job $nj
+        $cur = Read-Lease $n; $holder = if ((Lease-State $cur) -eq 'live') { [string]$cur.by } else { '' }
+        $q = Live-Queue $n $holder
+        $tmo = [double]$J.timeoutMin
+        $me = [pscustomobject][ordered]@{ by = [string]$J.runBy; note = [string]$J.note; est = [double]$J.est; joined = $(if ($J.submitted) { [string]$J.submitted } else { IsoFine $now }); nextCheck = Iso $now.AddMinutes($tmo); until = Iso $now.AddMinutes($tmo); pid = $null; pidStart = $null; job = $id; needQuiet = -not [bool]$J.noQuiet; parked = ''; quietKey = "$([bool]$J.allowEditor)|$([bool]$J.allowBuild)|$($J.maxVramGB)|$($J.maxUtil)"; prio = [int]$J.prio; notBefore = $null }
+        Write-Queue $n (Sort-Queue (@($q | Where-Object { $_.by -ne $J.runBy }) + @($me)))
+        Log-Line "submit $n $($J.runBy) again job $id (after preemption of $($J.id))"
+        return $id
+    }
+}
+function Preempt-Pass($Leases) {
+    # A running -Preemptible job gives way when a job of higher -Priority is first in its lease's queue (header: Later and first).
+    $out = @()
+    foreach ($n in $Names) {
+        $x = $Leases[$n]
+        if ($x.state -ne 'live') { continue }
+        $L = $x.lease; $j = Lease-Job $L
+        if (-not $j -or -not $j.preemptible -or -not $j.childPid) { continue }
+        $first = Queue-First (Live-Queue $n ([string]$L.by))
+        if (-not $first -or -not $first.job -or [int]$first.prio -le [int]$j.prio) { continue }
+        if ($CopMatch -and "$($j.exe) $($j.args)" -notmatch $CopMatch) { continue }
+        $why = "$($first.by) waits at priority $([int]$first.prio) and this preemptible job runs at $([int]$j.prio)"
+        if ($CopDryRun) { Say "would preempt job $($j.id) ($why)" Yellow; continue }
+        $marked = With-Lock {
+            $cur = Read-Lease $n; $jn = Read-Job $j.id
+            if (-not $cur -or $cur.by -ne $L.by -or [string]$cur.taken -ne [string]$L.taken) { return $false }
+            if (-not $jn -or [string]$jn.state -ne 'running') { return $false }
+            $jn.state = 'preempted'; $jn.ended = Now-Iso; $jn.why = "stopped by the cop: $why; queued again"; Write-Job $jn
+            Log-Line "job-preempt $n $($L.by) job $($j.id) ($why)"
+            return $true
+        }
+        if (-not $marked) { continue }
+        Stop-JobTree $j
+        $again = Requeue-Job $j
+        Cop-Note ([string]$j.by) "preempted your job $($j.id): $why. It is queued again as $again and starts over when its turn comes."
+        $out += @{ job = $j.id; again = $again; lease = $n; why = $why }
+    }
+    return , $out
+}
 function Alarm-Pass($Leases) {
     # A holder past its cap that Cap-Pass can't stop, with someone waiting: says so once per cap and stops nothing (header: the cop).
     $out = @()
@@ -1159,7 +1249,7 @@ function Alarm-Pass($Leases) {
         $waiting = (Live-Queue $n ([string]$L.by)).Count
         if (-not $waiting) { continue }
         # A gpu job is the cap's. A job just stopped can keep its lease for a moment, until its runner lets go.
-        $j = Lease-Job $L @('running', 'overrun', 'cancelled')
+        $j = Lease-Job $L @('running', 'overrun', 'cancelled', 'preempted')
         if ($j -and ($n -eq $CardLease -or [string]$j.state -ne 'running')) { continue }
         if ($CopMatch -and $(if ($j) { "$($j.exe) $($j.args)" } else { "$($L.by) $($L.note)" }) -notmatch $CopMatch) { continue }
         $tag = if ($j) { " job $($j.id)" } else { '' }
@@ -1183,7 +1273,7 @@ function Status-Queue([string]$Name, $X) {
     $holder = if ($X.state -eq 'live') { [string]$X.lease.by } else { '' }
     $q = Live-Queue $Name $holder
     $plan = Plan-Queue $q (Free-At $X.lease $X.state)
-    return @($plan | ForEach-Object { [pscustomobject]@{ by = $_.e.by; note = $_.e.note; est = $_.e.est; joined = $_.e.joined; start = Iso $_.start; nextCheck = $_.e.nextCheck; until = $_.e.until; job = $_.e.job; needQuiet = $_.e.needQuiet; parked = $_.e.parked; quietKey = $_.e.quietKey } })
+    return @($plan | ForEach-Object { [pscustomobject]@{ by = $_.e.by; note = $_.e.note; est = $_.e.est; joined = $_.e.joined; start = Iso $_.start; nextCheck = $_.e.nextCheck; until = $_.e.until; job = $_.e.job; needQuiet = $_.e.needQuiet; parked = $_.e.parked; quietKey = $_.e.quietKey; prio = [int]$_.e.prio; notBefore = $_.e.notBefore } })
 }
 # ---- watch: the live board ---------------------------------------------------------------------------------------------
 function Lease-Of([int]$P, $LeasePids) {
@@ -1476,6 +1566,7 @@ function Board-Model {
     }
     if ($script:CopOn) { try { if ((Reap-Pass $m.procs $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
     if ($script:CopOn) { try { if (@(Cap-Pass $m.leases).Count) { $m.leases = Get-Leases; $m.procs = Get-Procs } } catch {} }
+    if ($script:CopOn) { try { if (@(Preempt-Pass $m.leases).Count) { $m.leases = Get-Leases; $m.procs = Get-Procs } } catch {} }
     if ($script:CopOn) { try { if (@(Alarm-Pass $m.leases).Count) { $m.leases = Get-Leases } } catch {} }
     if ($script:CopOn) { try { if ((Dispatch-Pass).Count) { $m.leases = Get-Leases } } catch {} }
     if ($script:CopOn) { try { [void](Sink-Pass) } catch {} }
@@ -2075,6 +2166,7 @@ switch ($Verb) {
             # No process list means no judging who is idle.
             if ($null -ne $procs) { try { foreach ($rp in (Reap-Pass $procs (Get-Leases))) { Say "released $($rp.lease) from $($rp.by): $($rp.why)" Yellow } } catch { Say "reap pass failed: $($_.Exception.Message)" Yellow } }
             try { foreach ($cj in (Cap-Pass (Get-Leases))) { Say "$(if ($cj.stopped) { 'stopped' } else { 'over its cap, not stopped:' }) job $($cj.job): $($cj.why)" Red } } catch { Say "cap pass failed: $($_.Exception.Message)" Yellow }
+            try { foreach ($pj in (Preempt-Pass (Get-Leases))) { Say "preempted job $($pj.job) ($($pj.why)); queued again as $($pj.again)" Yellow } } catch { Say "preempt pass failed: $($_.Exception.Message)" Yellow }
             try { foreach ($ca in (Alarm-Pass (Get-Leases))) { Say "over its cap, not stopped: $($ca.by)'s $($ca.lease) lease$(if ($ca.job) { " (job $($ca.job))" }): $($ca.why)" Red } } catch { Say "alarm pass failed: $($_.Exception.Message)" Yellow }
             try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)$(if ($dj.lease -eq $CardLease) { " (cap ~$(Local-Hm (Job-CapAt $dj)))" })" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
             try { [void](Sink-Pass) } catch { Say "sink pass failed: $($_.Exception.Message)" Yellow }
