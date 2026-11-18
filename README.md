@@ -145,6 +145,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | `unqueue <lease> -By <who>` | Leave a queue. |
 | `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. |
 | `job [-JobId <id>] [-By <who>] [-Json] [-Cancel]` | A job's state, exit code and output tail, or the job list. `-Cancel` kills the tree. |
+| `stats [-Days 14] [-By <who>] [-Json]` | What jobs took against what they said: per kind of job, the median estimate, the median run, how many ran late, and the median wait. `submit` uses the same history: an estimate far under what jobs like it took gets an `estimate check` line (and `estimateHint` with `-Json`). |
 | `run -By <who> -Exe <path> [-ArgList] [-Lease gpu] [-NoQuiet]` | Wait in line, wait for quiet, take the lease, run, release, return the exit code. Waits for quiet on any lease unless `-NoQuiet`. |
 | `& hold [lease] -By <who> [-NoQuiet]` | For launcher scripts: take the lease tied to the calling process. Waits for quiet on `gpu` only. |
 | `quiet [-Wait] [-MaxVramGB 3.5] [-MaxUtil 50] [-SettleSec 20] [-AllowEditor] [-AllowBuild]` | Is the GPU quiet? Exit 3 if not. `run`, `hold` and `submit` take the same switches. |
@@ -202,7 +203,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 275 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 280 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the

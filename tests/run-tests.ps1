@@ -91,6 +91,27 @@ try {
     Check 'ended job: its entry is dequeued and logged' ($out -match "dequeue gpu $([regex]::Escape($dead.runBy)) \(job expired\)" -and -not @((Status).queues.gpu | Where-Object { $_.job }).Count)
     Check 'ended job: it never started' ((Job $dead.id).state -eq 'expired')
     [void](T release gpu -By next)
+    # --- stats: what ran against what was estimated, and the estimate check on submit
+    [void](T submit build -By st -Exe cmd.exe -ArgList '/c exit 0' -For 'stats probe 1' -EstMin 1 -NoQuiet)
+    $sp = Wait-Job (LastId) @('done', 'failed')
+    Check 'stats: a job that ran records when it took the lease' ($sp.state -eq 'done' -and [bool]$sp.took)
+    foreach ($i in 1..3) {
+        $t0 = [DateTime]::UtcNow.AddHours(-$i); $f = 'yyyy-MM-ddTHH:mm:ssZ'
+        $fj = [ordered]@{ id = "st.j9$i-old"; by = 'st'; runBy = "st.j9$i"; lease = 'build'; note = "stats probe 9$i"; est = 1; exe = [string]$sp.exe; args = '/c exit 0'
+            state = 'done'; exit = 0; submitted = $t0.ToString($f); started = $t0.ToString($f); took = $t0.ToString($f); ended = $t0.AddMinutes(30).ToString($f) }
+        [IO.File]::WriteAllText((Join-Path $D "jobs\$($fj.id).json"), ($fj | ConvertTo-Json))
+    }
+    $rc = T submit build -By st -Exe cmd.exe -ArgList '/c exit 0' -For 'stats probe 2' -EstMin 1 -NoQuiet
+    Check 'submit: an estimate far under what jobs like it took gets an estimate check' ($rc -eq 0 -and $out -match 'estimate check: the last 4 jobs like this ran a median of 30 min and you said 1\.')
+    [void](Wait-Job (LastId) @('done', 'failed'))
+    [void](T submit build -By st -Exe cmd.exe -ArgList '/c exit 0' -For 'stats probe 3' -EstMin 30 -NoQuiet)
+    Check 'submit: a true estimate gets none' ($out -notmatch 'estimate check' -and $out -match 'job -JobId')
+    [void](Wait-Job (LastId) @('done', 'failed'))
+    $sj = & $Shell -NoProfile -File $thor stats -By st -Json -Dir $D | ConvertFrom-Json
+    $script:out = $sj | ConvertTo-Json -Depth 4
+    $sk = @($sj.kinds | Where-Object { $_.what -eq 'cmd.exe stats probe #' })
+    Check 'stats -Json: one row for the kind, with its medians' ($sj.ran -eq 6 -and $sk.Count -eq 1 -and $sk[0].n -eq 6 -and $sk[0].lease -eq 'build' -and $sk[0].actual -ge 15 -and $sk[0].late -eq 3)
+    Check 'stats: the table lists it' ((T stats -By st) -eq 0 -and $out -match '6 ran' -and $out -match 'cmd\.exe stats probe #')
     # --- board: one frame from the demo fixture
     $DD = "$D-demo"
     & $Shell -NoProfile -File (Join-Path $root 'demo\seed.ps1') -Dir $DD | Out-Null

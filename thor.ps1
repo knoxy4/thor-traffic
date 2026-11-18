@@ -14,6 +14,7 @@
 #   thor.ps1 submit  [gpu|editor|build] -By <who> -Exe <path> [-ArgList '<args>'] [-WorkDir <dir>] [-For 'what'] [-EstMin 20]
 #                    [-Quiet] [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
 #   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
+#   thor.ps1 stats   [-Days 14] [-By <who>] [-Json]
 #   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
 #   thor.ps1 quiet   [-By <who>] [-Wait] [-TimeoutMin 30] [-SettleSec 20] [-MaxVramGB 3.5] [-MaxUtil 50] [-AllowEditor] [-AllowBuild]
@@ -106,7 +107,7 @@
 #
 # Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first), 3 not quiet.
 param(
-    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job')][string]$Verb,
+    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats')][string]$Verb,
     [Parameter(Position = 1)][ValidateSet('editor', 'gpu', 'build')][string]$Lease,
     [string]$By,
     [string]$For = '',
@@ -131,6 +132,7 @@ param(
     [double]$ReapAfterMin = 10,
     [int]$Every = 5,
     [int]$LogLines = 10,
+    [double]$Days = 14,
     [switch]$Once,
     [switch]$NoCop,
     [switch]$Plain,
@@ -535,7 +537,7 @@ function Do-Submit {
             id = $id; by = $By; runBy = $runBy; lease = $Lease; note = $For; est = $est
             exe = $exePath; args = $ArgList; cwd = $cwd; noQuiet = [bool]$NoQuiet; timeoutMin = $tmo
             allowEditor = [bool]$AllowEditor; allowBuild = [bool]$AllowBuild; maxVramGB = $MaxVramGB; maxUtil = $MaxUtil; settleSec = $SettleSec
-            state = 'queued'; why = ''; submitted = Iso $now; started = $null; ended = $null; exit = $null; runPid = $null; childPid = $null
+            state = 'queued'; why = ''; submitted = Iso $now; started = $null; took = $null; ended = $null; exit = $null; runPid = $null; childPid = $null
             log = (Join-Path $JobDir "$id.log"); out = (Join-Path $JobDir "$id.out.log"); err = (Join-Path $JobDir "$id.err.log")
         }
         Write-Job $job
@@ -550,7 +552,15 @@ function Do-Submit {
     }
     [void](Dispatch-Pass)
     $j = Read-Job $res.id
-    if ($Json) { $j | ConvertTo-Json -Depth 4; exit 0 }
+    # The estimate check: jobs like this one have a history, and an estimate far under it is everyone else's wait time.
+    $hint = ''
+    try {
+        $like = @(Job-Stats 30 | Where-Object { $_.key -eq (Job-Kind $j) }) | Select-Object -First 1
+        if ($like -and $like.n -ge 3 -and $like.actual -ge 1.25 * $est -and ($like.actual - $est) -ge 2) {
+            $hint = "the last $($like.n) jobs like this ran a median of $($like.actual) min and you said $est. Your estimate is everyone's wait and sets its cap: cancel it and submit again with a true -EstMin, or renew -EstMin once it runs"
+        }
+    } catch {}
+    if ($Json) { if ($hint) { $j | Add-Member -NotePropertyName estimateHint -NotePropertyValue $hint -Force }; $j | ConvertTo-Json -Depth 4; exit 0 }
     if ($j.state -eq 'queued') {
         $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
         Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
@@ -560,6 +570,7 @@ function Do-Submit {
         Say "its cap falls about $(Local-Hm $capT), $(Cap-Span $est) min after it starts (2 x est + $CapPadMin). Past that with someone waiting, the cop stops it$(if ($LaneBreakOn) { " and cancels its lane's queued jobs" }); renew gpu -By $($res.runBy) -EstMin <n> moves it."
     }
     if ($Lease -eq $CardLease -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
+    if ($hint) { Say "estimate check: $hint." Yellow }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
@@ -652,6 +663,51 @@ function Job-Line($J) {
     $ex = if ($null -ne $J.exit) { " exit $($J.exit)" } else { '' }
     $wt = if ([string]$J.state -eq 'starting' -and $J.waiting) { "  [waits: $(Short ([string]$J.waiting) 70)]" } else { '' }
     return ('{0,-26} {1,-9} {2,-6} sub {3}  start {4}  end {5}{6}  {7}{8}' -f $J.id, $J.state, $J.lease, (& $t $J.submitted), (& $t $J.started), (& $t $J.ended), $ex, (Short ([string]$J.note) 60), $wt)
+}
+# ---- stats ---------------------------------------------------------------------------------------------------------------
+function Job-Kind($J) {
+    # What "a job like this one" means: the same lease, the same program and the same note with its numbers flattened, so run 3
+    # and run 12 are one kind. With no note its arguments stand in.
+    $leaf = [string]$J.exe; try { $leaf = [IO.Path]::GetFileName($leaf) } catch {}
+    $what = if ([string]$J.note) { [string]$J.note } else { [string]$J.args }
+    return ("$($J.lease)|$leaf|$(Short ($what -replace '\d+', '#') 80)").ToLower()
+}
+function Job-Ran($J) {
+    # Minutes its command ran, or $null if it never ran or was cancelled. Counted from the take (took), so a wait for quiet isn't
+    # billed to it; a job file from before that field has only its dispatch time.
+    if (-not $J.ended -or [string]$J.state -notin @('done', 'failed', 'overrun')) { return $null }
+    if ([string]$J.state -eq 'failed' -and $null -eq $J.exit) { return $null }
+    $from = if ($J.took) { $J.took } else { $J.started }
+    if (-not $from) { return $null }
+    return [Math]::Max(0.0, ((To-Utc $J.ended) - (To-Utc $from)).TotalMinutes)
+}
+function Median($V) {
+    $s = @($V | Sort-Object); $c = $s.Count
+    if (-not $c) { return $null }
+    if ($c % 2) { return [double]$s[[int](($c - 1) / 2)] }
+    return ([double]$s[[int]($c / 2) - 1] + [double]$s[[int]($c / 2)]) / 2
+}
+function Job-Stats([double]$SinceDays, [string]$Root = '') {
+    # One row per kind of job that ran in the window: what its estimates said against what it took. Worst ratio first.
+    $acc = @()
+    $jobs = @(Recent-Jobs ([int][Math]::Ceiling($SinceDays * 24)) | Where-Object { -not $Root -or (Lane-Root ([string]$_.by)) -eq $Root })
+    foreach ($g in @($jobs | Group-Object { Job-Kind $_ })) {
+        $ran = @($g.Group | ForEach-Object {
+                $m = Job-Ran $_
+                if ($null -ne $m) { [pscustomobject]@{ min = $m; est = [double]$_.est; state = [string]$_.state; wait = $(if ($_.took) { ((To-Utc $_.took) - (To-Utc $_.submitted)).TotalMinutes }) } }
+            })
+        if (-not $ran.Count) { continue }
+        $k = [string]$g.Name -split '\|', 3
+        $est = Median @($ran | ForEach-Object { $_.est }); $act = Median @($ran | ForEach-Object { $_.min })
+        $waits = @($ran | Where-Object { $null -ne $_.wait } | ForEach-Object { $_.wait })
+        $acc += [pscustomobject][ordered]@{
+            key = [string]$g.Name; lease = $k[0]; what = "$($k[1]) $($k[2])".Trim(); n = $ran.Count
+            est = [Math]::Round($est, 1); actual = [Math]::Round($act, 1); ratio = $(if ($est -gt 0) { [Math]::Round($act / $est, 2) } else { 0 })
+            late = @($ran | Where-Object { $_.min -gt $_.est }).Count; overrun = @($ran | Where-Object { $_.state -eq 'overrun' }).Count
+            wait = $(if ($waits.Count) { [Math]::Round((Median $waits), 1) })
+        }
+    }
+    return @($acc | Sort-Object -Property @{ Expression = { [double]$_.ratio }; Descending = $true }, @{ Expression = { $_.n }; Descending = $true })
 }
 # ---- the box ------------------------------------------------------------------------------------------------------------
 function Read-Fixture {
@@ -1937,7 +1993,7 @@ switch ($Verb) {
                 $cur = Read-Lease $Lease
                 if ($cur -and $cur.by -eq $By -and [int]$cur.pid -eq $PID) { $cur.childPid = $p.Id; Write-Lease $Lease $cur }
             } | Out-Null
-            if ($JobId) { [void](Set-Job $JobId @{ state = 'running'; childPid = $p.Id; waiting = '' } @('starting')) }
+            if ($JobId) { [void](Set-Job $JobId @{ state = 'running'; childPid = $p.Id; waiting = ''; took = Now-Iso } @('starting')) }
             Say "$Lease held; started pid $($p.Id): $Exe $ArgList" Green
             $p.WaitForExit()
             $code = $p.ExitCode
@@ -1970,6 +2026,25 @@ switch ($Verb) {
         # lease keeps the wait: it's what keeps a build job off an open editor.
         if ($Lease -eq $CardLease -and -not @($script:BoundKeys | Where-Object { $_ -in @('Quiet', 'AllowEditor', 'AllowBuild', 'MaxVramGB', 'MaxUtil', 'SettleSec') }).Count) { $NoQuiet = $true }
         Do-Submit
+    }
+    'stats' {
+        $root = if ($By) { Lane-Root ($By.Trim().ToLower()) } else { '' }
+        $all = @(Recent-Jobs ([int][Math]::Ceiling($Days * 24)) | Where-Object { -not $root -or (Lane-Root ([string]$_.by)) -eq $root })
+        $kinds = @(Job-Stats $Days $root)
+        $ran = 0; foreach ($r in $kinds) { $ran += [int]$r.n }
+        $never = @($all | Where-Object { [string]$_.state -in @('expired', 'lost') -or ([string]$_.state -eq 'failed' -and $null -eq $_.exit) }).Count
+        $canc = @($all | Where-Object { [string]$_.state -eq 'cancelled' }).Count
+        $ovr = @($all | Where-Object { [string]$_.state -eq 'overrun' }).Count
+        if ($Json) { [ordered]@{ days = $Days; by = $root; jobs = $all.Count; ran = $ran; neverStarted = $never; cancelled = $canc; overrun = $ovr; kinds = $kinds } | ConvertTo-Json -Depth 4; exit 0 }
+        Say "jobs in the last $Days days$(if ($root) { " for $root" }): $($all.Count) submitted, $ran ran, $never never started, $canc cancelled, $ovr stopped at their cap"
+        if (-not $kinds.Count) { exit 0 }
+        Write-Host ('  {0,-7} {1,4} {2,7} {3,7} {4,6} {5,5} {6,7}  {7}' -f 'lease', 'ran', 'est', 'actual', 'x est', 'late', 'waited', 'what')
+        foreach ($r in $kinds) {
+            $col = if ($r.ratio -ge 1.5) { 'Red' } elseif ($r.ratio -gt 1) { 'Yellow' } else { 'Gray' }
+            Write-Host ('  {0,-7} {1,4} {2,7} {3,7} {4,6} {5,5} {6,7}  {7}' -f $r.lease, $r.n, $r.est, $r.actual, $r.ratio, $r.late, $(if ($null -ne $r.wait) { $r.wait } else { '-' }), $r.what) -ForegroundColor $col
+        }
+        Say 'est and actual are medians in minutes; late = runs past their estimate; waited = median minutes from submit to the take.'
+        exit 0
     }
     'job' {
         if (-not $JobId) {
