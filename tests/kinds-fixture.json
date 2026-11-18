@@ -1,0 +1,163 @@
+{
+  "gpu": {
+    "usedMB": 900,
+    "totalMB": 12288,
+    "util": 3
+  },
+  "procs": [
+    {
+      "pid": 101,
+      "ppid": 4,
+      "name": "UnrealEditor-Cmd.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor-Cmd.exe Outpost.uproject -run=ResavePackages"
+    },
+    {
+      "pid": 102,
+      "ppid": 4,
+      "name": "UnrealEditor.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor.exe Outpost.uproject -run=Cook"
+    },
+    {
+      "pid": 103,
+      "ppid": 4,
+      "name": "UnrealEditor.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor.exe Outpost.uproject -game -windowed"
+    },
+    {
+      "pid": 104,
+      "ppid": 4,
+      "name": "UnrealEditor.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor.exe Outpost.uproject"
+    },
+    {
+      "pid": 105,
+      "ppid": 4,
+      "name": "Outpost-Win64-Shipping.exe",
+      "agoSec": 600,
+      "cmd": "Outpost-Win64-Shipping.exe"
+    },
+    {
+      "pid": 106,
+      "ppid": 4,
+      "name": "llama-server.exe",
+      "agoSec": 600,
+      "cmd": "llama-server.exe -m model.gguf"
+    },
+    {
+      "pid": 107,
+      "ppid": 4,
+      "name": "ollama.exe",
+      "agoSec": 600,
+      "cmd": "ollama.exe runner --model m --port 5"
+    },
+    {
+      "pid": 108,
+      "ppid": 4,
+      "name": "ollama.exe",
+      "agoSec": 600,
+      "cmd": "ollama.exe serve"
+    },
+    {
+      "pid": 109,
+      "ppid": 4,
+      "name": "python.exe",
+      "agoSec": 600,
+      "cmd": "python.exe ComfyUI\\main.py"
+    },
+    {
+      "pid": 110,
+      "ppid": 4,
+      "name": "python.exe",
+      "agoSec": 600,
+      "cmd": "python.exe train.py"
+    },
+    {
+      "pid": 111,
+      "ppid": 4,
+      "name": "UnrealBuildTool.exe",
+      "agoSec": 600,
+      "cmd": "UnrealBuildTool.exe Outpost Win64 Development"
+    },
+    {
+      "pid": 112,
+      "ppid": 4,
+      "name": "ShaderCompileWorker.exe",
+      "agoSec": 600,
+      "cmd": "ShaderCompileWorker.exe -Unattended"
+    },
+    {
+      "pid": 113,
+      "ppid": 4,
+      "name": "cargo.exe",
+      "agoSec": 600,
+      "cmd": "cargo.exe build"
+    },
+    {
+      "pid": 114,
+      "ppid": 4,
+      "name": "dotnet.exe",
+      "agoSec": 600,
+      "cmd": "dotnet.exe UnrealBuildTool.dll Outpost"
+    },
+    {
+      "pid": 115,
+      "ppid": 4,
+      "name": "dotnet.exe",
+      "agoSec": 600,
+      "cmd": "dotnet.exe test"
+    },
+    {
+      "pid": 116,
+      "ppid": 4,
+      "name": "unrealeditor.EXE",
+      "agoSec": 600,
+      "cmd": "unrealeditor.EXE Outpost.uproject -GAME"
+    },
+    {
+      "pid": 117,
+      "ppid": 4,
+      "name": "pythonw.exe",
+      "agoSec": 600,
+      "cmd": "pythonw.exe run_diffusers.py"
+    },
+    {
+      "pid": 118,
+      "ppid": 4,
+      "name": "AutomationTool.exe",
+      "agoSec": 600,
+      "cmd": "AutomationTool.exe BuildCookRun"
+    },
+    {
+      "pid": 119,
+      "ppid": 4,
+      "name": "rustc.exe",
+      "agoSec": 600,
+      "cmd": "rustc.exe main.rs"
+    },
+    {
+      "pid": 120,
+      "ppid": 4,
+      "name": "ollama_llama_server.exe",
+      "agoSec": 600,
+      "cmd": "ollama_llama_server.exe"
+    },
+    {
+      "pid": 121,
+      "ppid": 4,
+      "name": "UnrealEditor.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor.exe Outpost.uproject -gamepad"
+    },
+    {
+      "pid": 122,
+      "ppid": 4,
+      "name": "notepad.exe",
+      "agoSec": 600,
+      "cmd": "notepad.exe -game -run=x"
+    }
+  ]
+}

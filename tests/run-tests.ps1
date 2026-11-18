@@ -99,6 +99,20 @@ try {
     Check 'board frame renders' ($plain -match 'THOR TRAFFIC' -and $plain -match 'NEXT 90 MIN')
     Check 'board tags the uncovered run NO LEASE' ($plain -match 'NO LEASE')
     Check 'board shows the queued job as AUTO' ($plain -match 'AUTO: starts itself')
+    # --- the profile table: every kind rule classifies as it always did, and quiet names each noisy kind its own way
+    $kf = Join-Path $PSScriptRoot 'kinds-fixture.json'
+    $ks = & $Shell -NoProfile -File $thor status -Json -Dir $DD -Fixture $kf | ConvertFrom-Json
+    $got = (@($ks.procs | Sort-Object pid | ForEach-Object { "$($_.pid)=$($_.kind)$(if ($_.cpp) { '+cpp' })" }) -join ' ')
+    $want = '101=commandlet 102=commandlet 103=game 104=editor 105=packaged 106=llm 107=llm 109=imagegen 111=build+cpp 112=build 113=build 114=build+cpp 116=game 117=imagegen 118=build+cpp 119=build 120=llm 121=editor'
+    $script:out = $got
+    Check 'kinds: each rule gives its kind, first match wins' ($got -eq $want)
+    $rs = @($ks.reasons) -join "`n"; $script:out = $rs
+    Check 'kinds: quiet names each noisy kind' ($rs -match 'local LLM loaded: llama-server\.exe pid 106' -and $rs -match 'image generation: python\.exe pid 109' -and
+        $rs -match '-game run: pid 103 ' -and $rs -match 'packaged game: Outpost-Win64-Shipping\.exe pid 105' -and $rs -match 'commandlet: pid 101 ' -and
+        $rs -match 'editor open: pid 104 .*\(-AllowEditor to ignore\)' -and $rs -match 'build work: cargo\.exe pid 113 \(-AllowBuild to ignore\)')
+    $qo = (& $Shell -NoProfile -File $thor quiet -AllowEditor -AllowBuild -Dir $DD -Fixture $kf 2>&1 | ForEach-Object { "$_" }) -join "`n"; $script:out = $qo
+    Check 'kinds: -AllowEditor and -AllowBuild drop only their kinds' ($LASTEXITCODE -eq 3 -and $qo -notmatch 'editor open' -and $qo -notmatch 'build work' -and $qo -match 'commandlet: pid 101' -and $qo -match 'local LLM loaded')
+    Check 'status -Json lists the leases in table order' (@($ks.leases.PSObject.Properties.Name) -join ',' -eq 'editor,gpu,build' -and @($ks.queues.PSObject.Properties.Name) -join ',' -eq 'editor,gpu,build')
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
     foreach ($suite in @('quiet-wait', 'cap')) {
         $qp = 0; $qf = 0

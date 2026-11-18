@@ -156,9 +156,50 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:BoundKeys = @($PSBoundParameters.Keys)
-$Names = @('editor', 'gpu', 'build')
+# ---- the profile: leases and process kinds as data (this one is the Unreal preset) ---------------------------------------
+# The code below asks this table what a lease is and what a process is.
+# Lease traits: minutes = default expiry. busy = process kinds that count as the lease in use; busyCpp = kinds that count only
+#   when they are a C++ build. covers = kinds a live lease covers without a pid tie. strike = kinds logged as a strike when a
+#   C++ one runs without the lease. card = the one lease the GPU reading gates: an agent's uncovered `enforce` kinds are stopped,
+#   its jobs are capped, hold waits for quiet on it, a job on it asks for quiet, and it is the lease a verb takes by default.
+# Kind rules, first match wins: name = regex on the process name, cmd = regex on its command line, cpp = it is a C++ build.
+# Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
+#   neverStop = it writes assets, so the overrun cap never stops a job with one in its tree.
+$Traits = @{
+    leases = [ordered]@{
+        editor = @{ minutes = 120; busy = @('editor', 'commandlet'); busyCpp = @(); covers = @('editor'); strike = @() }
+        gpu    = @{ minutes = 30; busy = @('game', 'packaged', 'llm', 'imagegen'); busyCpp = @(); covers = @(); strike = @(); card = $true; enforce = @('game', 'packaged') }
+        build  = @{ minutes = 60; busy = @('commandlet'); busyCpp = @('build'); covers = @('build'); strike = @('build') }
+    }
+    rules = @(
+        @{ kind = 'commandlet'; name = '(?i)^UnrealEditor-Cmd\.exe$' }
+        @{ kind = 'commandlet'; name = '(?i)^UnrealEditor\.exe$'; cmd = '(?i)(^|\s)-run=' }
+        @{ kind = 'game'; name = '(?i)^UnrealEditor\.exe$'; cmd = '(?i)(^|\s)-game(\s|$)' }
+        @{ kind = 'editor'; name = '(?i)^UnrealEditor\.exe$' }
+        @{ kind = 'packaged'; name = $GameExe }
+        @{ kind = 'llm'; name = '(?i)^(llama-server|ollama_llama_server)' }
+        @{ kind = 'llm'; name = '(?i)^ollama\.exe$'; cmd = '(?i)\srunner(\s|$)' }
+        @{ kind = 'imagegen'; name = '(?i)^pythonw?\.exe$'; cmd = '(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen' }
+        @{ kind = 'build'; name = '(?i)^(UnrealBuildTool|AutomationTool)\.exe$'; cpp = $true }
+        @{ kind = 'build'; name = '(?i)^(ShaderCompileWorker|cargo|rustc)\.exe$' }
+        @{ kind = 'build'; name = '(?i)^dotnet\.exe$'; cmd = '(?i)UnrealBuildTool|AutomationTool'; cpp = $true }
+    )
+    kinds = @{
+        llm        = @{ noise = 'local LLM loaded: {name} pid {pid}' }
+        imagegen   = @{ noise = 'image generation: {name} pid {pid}' }
+        game       = @{ noise = '-game run: pid {pid} {cmd}' }
+        packaged   = @{ noise = 'packaged game: {name} pid {pid}' }
+        commandlet = @{ noise = 'commandlet: pid {pid} {cmd}'; neverStop = $true }
+        editor     = @{ noise = 'editor open: pid {pid} {cmd} (-AllowEditor to ignore)'; allow = 'AllowEditor'; neverStop = $true }
+        build      = @{ noise = 'build work: {name} pid {pid} (-AllowBuild to ignore)'; allow = 'AllowBuild' }
+    }
+}
+$Names = @($Traits.leases.Keys)
+$CardLease = [string]($Names | Where-Object { $Traits.leases[$_].card } | Select-Object -First 1)
+$NeverStop = @($Traits.kinds.Keys | Where-Object { $Traits.kinds[$_].neverStop })
+$StrikeKinds = @($Names | ForEach-Object { $Traits.leases[$_].strike } | Where-Object { $_ } | Select-Object -Unique)
 $script:Struck = @{}
-$DefaultMin = @{ editor = 120; gpu = 30; build = 60 }
+$DefaultMin = @{}; foreach ($n in $Names) { $DefaultMin[$n] = $Traits.leases[$n].minutes }
 $LeaseDir = Join-Path $Dir 'leases'
 $QueueDir = Join-Path $Dir 'queue'
 $JobDir = Join-Path $Dir 'jobs'; $JobWaitMin = 240
@@ -514,11 +555,11 @@ function Do-Submit {
         $ahead = if ($res.holder) { "held by $($res.holder)" } else { 'free, but behind the queue' }
         Say "job $($res.id) queued: $Lease #$($res.pos) of $($res.total) ($ahead); expected start about $(Local-Hm $res.start) (in $(Mins $res.start) min). It starts itself; no check-back needed." Green
     } else { Say "job $($res.id): $Lease was free; $($j.state) now" Green }
-    if ($Lease -eq 'gpu') {
+    if ($Lease -eq $CardLease) {
         $capT = $(if ($j.state -eq 'queued') { $res.start } else { [DateTime]::UtcNow }).AddMinutes((Cap-Span $est))
         Say "its cap falls about $(Local-Hm $capT), $(Cap-Span $est) min after it starts (2 x est + $CapPadMin). Past that with someone waiting, the cop stops it$(if ($LaneBreakOn) { " and cancels its lane's queued jobs" }); renew gpu -By $($res.runBy) -EstMin <n> moves it."
     }
-    if ($Lease -eq 'gpu' -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
+    if ($Lease -eq $CardLease -and $script:BoundKeys -notcontains 'NoQuiet' -and $NoQuiet) { Say 'it does not wait for a quiet GPU; timed work (fps, load, frame cost) must add -Quiet' }
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
@@ -540,7 +581,7 @@ function Dispatch-Pass {
             $j = Read-Job ([string]$first.job)
             if (-not $j -or [string]$j.state -ne 'queued') { return $null }
             $j.state = 'starting'; $j.started = Now-Iso; Write-Job $j
-            Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($nm -eq 'gpu') { " cap ~$(Iso (Job-CapAt $j))" })$(if ($j.note) { " for: $($j.note)" })"
+            Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($nm -eq $CardLease) { " cap ~$(Iso (Job-CapAt $j))" })$(if ($j.note) { " for: $($j.note)" })"
             return $j
         }
         if (-not $go) { continue }
@@ -663,20 +704,12 @@ function Get-Procs {
             started = $(if ($p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime() } else { [DateTime]::MinValue }) }
     }
     $out = foreach ($p in $all) {
-        $n = [string]$p.Name; $c = [string]$p.CommandLine; $k = $null
-        if ($n -ieq 'UnrealEditor-Cmd.exe') { $k = 'commandlet' }
-        elseif ($n -ieq 'UnrealEditor.exe') {
-            if ($c -match '(?i)(^|\s)-run=') { $k = 'commandlet' }
-            elseif ($c -match '(?i)(^|\s)-game(\s|$)') { $k = 'game' }
-            else { $k = 'editor' }
+        $n = [string]$p.Name; $c = [string]$p.CommandLine; $k = $null; $cpp = $false
+        foreach ($r in $Traits.rules) {
+            if (-not $r.name -or $n -notmatch $r.name) { continue }
+            if ($r.cmd -and $c -notmatch $r.cmd) { continue }
+            $k = $r.kind; $cpp = [bool]$r.cpp; break
         }
-        elseif ($GameExe -and $n -match $GameExe) { $k = 'packaged' }
-        elseif ($n -match '(?i)^(llama-server|ollama_llama_server)') { $k = 'llm' }
-        elseif ($n -ieq 'ollama.exe' -and $c -match '(?i)\srunner(\s|$)') { $k = 'llm' }
-        elseif ($n -match '(?i)^pythonw?\.exe$' -and $c -match '(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen') { $k = 'imagegen' }
-        elseif ($n -match '(?i)^(UnrealBuildTool|AutomationTool|ShaderCompileWorker|cargo|rustc)\.exe$') { $k = 'build' }
-        elseif ($n -ieq 'dotnet.exe' -and $c -match '(?i)UnrealBuildTool|AutomationTool') { $k = 'build' }
-        $cpp = $k -eq 'build' -and ($n -match '(?i)^(UnrealBuildTool|AutomationTool)\.exe$' -or $n -ieq 'dotnet.exe')
         if ($k) { [pscustomobject]@{ kind = $k; cpp = $cpp; pid = [int]$p.ProcessId; name = $n; cmd = (Short-Cmd $n $c); full = $c; started = $(if ($p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime() } else { [DateTime]::UtcNow }) } }
     }
     return @($out)
@@ -688,24 +721,20 @@ function Get-Leases {
 }
 function Quiet-Reasons($Gpu, $Procs, $Leases, [int[]]$SkipPids = @()) {
     $r = New-Object Collections.Generic.List[string]
-    $g = $Leases['gpu']
+    $g = $Leases[$CardLease]
     if ($g.state -eq 'live' -and $g.lease.by -ne $By) { $r.Add("gpu lease: $(Describe-Lease $g.lease)") }
     if (-not $Gpu) { $r.Add('nvidia-smi gave no reading') }
     else {
         if ($Gpu.usedMB -gt $MaxVramGB * 1024) { $r.Add(('{0:N1} GB video memory in use (gate {1} GB)' -f ($Gpu.usedMB / 1024), $MaxVramGB)) }
         if ($Gpu.util -gt $MaxUtil) { $r.Add("GPU $($Gpu.util) % busy (gate $MaxUtil %)") }
     }
+    $allowed = @{ AllowEditor = [bool]$AllowEditor; AllowBuild = [bool]$AllowBuild }
     foreach ($p in $Procs) {
         if ($SkipPids -contains $p.pid) { continue }
-        switch ($p.kind) {
-            'llm' { $r.Add("local LLM loaded: $($p.name) pid $($p.pid)") }
-            'imagegen' { $r.Add("image generation: $($p.name) pid $($p.pid)") }
-            'game' { $r.Add("-game run: pid $($p.pid) $($p.cmd)") }
-            'packaged' { $r.Add("packaged game: $($p.name) pid $($p.pid)") }
-            'commandlet' { $r.Add("commandlet: pid $($p.pid) $($p.cmd)") }
-            'editor' { if (-not $AllowEditor) { $r.Add("editor open: pid $($p.pid) $($p.cmd) (-AllowEditor to ignore)") } }
-            'build' { if (-not $AllowBuild) { $r.Add("build work: $($p.name) pid $($p.pid) (-AllowBuild to ignore)") } }
-        }
+        $kt = $Traits.kinds[[string]$p.kind]
+        if (-not $kt -or -not $kt.noise) { continue }
+        if ($kt.allow -and $allowed[$kt.allow]) { continue }
+        $r.Add($kt.noise.Replace('{name}', [string]$p.name).Replace('{pid}', [string]$p.pid).Replace('{cmd}', [string]$p.cmd))
     }
     return , $r
 }
@@ -787,16 +816,11 @@ function Wait-Lease([string]$Name, [int]$Min, [int]$TiePid, [DateTime]$Deadline,
 function Lease-Busy([string]$Name, $L, $Procs) {
     # Is anything using this lease? A command it started, or anything of its kind on the box, whoever's it is: a false yes only keeps a lease a while longer.
     if ($L.childPid -and (Get-Process -Id ([int]$L.childPid) -ErrorAction SilentlyContinue)) { return $true }
-    switch ($Name) {
-        'editor' { return @($Procs | Where-Object { $_.kind -in @('editor', 'commandlet') }).Count -gt 0 }
-        'build' { return @($Procs | Where-Object { $_.kind -eq 'commandlet' -or ($_.kind -eq 'build' -and $_.cpp) }).Count -gt 0 }
-        'gpu' {
-            if (@($Procs | Where-Object { $_.kind -in @('game', 'packaged', 'llm', 'imagegen') }).Count) { return $true }
-            $card = Get-Gpu
-            return (-not $card) -or $card.util -gt $MaxUtil
-        }
-    }
-    return $true
+    $lt = $Traits.leases[$Name]
+    if (-not $lt) { return $true }
+    if (@($Procs | Where-Object { $_.kind -in $lt.busy -or ($_.kind -in $lt.busyCpp -and $_.cpp) }).Count) { return $true }
+    if ($lt.card) { $card = Get-Gpu; return (-not $card) -or $card.util -gt $MaxUtil }
+    return $false
 }
 function Reap-Pass($Procs, $Leases) {
     # Frees a lease nobody is using (header: the cop). Past its estimate and nothing running: the idle clock starts. Still idle after -ReapAfterMin with someone waiting: it goes.
@@ -870,7 +894,7 @@ function Lane-Break($Over, [string]$Name) {
 }
 function Asset-Writer([int]$Root, $Procs) {
     # A commandlet or an editor in the tree under $Root, from Get-Procs' table. A -game run isn't one: the cop already stops those, and it writes no assets.
-    foreach ($p in @($Procs | Where-Object { $_.kind -in @('commandlet', 'editor') })) {
+    foreach ($p in @($Procs | Where-Object { $_.kind -in $NeverStop })) {
         $cur = $p.pid
         for ($i = 0; $i -lt 32; $i++) {
             if ($cur -eq $Root) { return $p }
@@ -894,12 +918,12 @@ function Lease-Job($L, [string[]]$States = @('running')) {
 function Cap-Pass($Leases) {
     # Stops a gpu job past its cap with someone waiting (header: the cop). With a commandlet or an editor in its tree it only says so. Plain takes and the other leases go to Alarm-Pass.
     $out = @()
-    $x = $Leases['gpu']
+    $x = $Leases[$CardLease]
     if ($x.state -ne 'live') { return $out }
     $L = $x.lease; $now = [DateTime]::UtcNow
     $cap = Cap-At $L
     if (-not $cap -or $now -lt $cap) { return $out }
-    $waiting = (Live-Queue 'gpu' ([string]$L.by)).Count
+    $waiting = (Live-Queue $CardLease ([string]$L.by)).Count
     if (-not $waiting) { return $out }
     $j = Lease-Job $L
     if (-not $j -or -not $j.childPid) { return $out }
@@ -916,13 +940,13 @@ function Cap-Pass($Leases) {
         return $out
     }
     if ($CopDryRun) {
-        $sibs = if ($LaneBreakOn) { @(Lane-Queued $j 'gpu' | ForEach-Object { [string]$_.runBy }) -join ', ' } else { '' }
+        $sibs = if ($LaneBreakOn) { @(Lane-Queued $j $CardLease | ForEach-Object { [string]$_.runBy }) -join ', ' } else { '' }
         Say "would stop job $($j.id) ($over)$(if ($sibs) { " and cancel $sibs" })" Yellow
         return $out
     }
     $marked = With-Lock {
         # It may have renewed, or ended, since the look above. Marked first, so the runner's own ending can't write over it.
-        $cur = Read-Lease 'gpu'; $jn = Read-Job $j.id
+        $cur = Read-Lease $CardLease; $jn = Read-Job $j.id
         if (-not $cur -or $cur.by -ne $L.by -or [string]$cur.taken -ne [string]$L.taken -or [string]$cur.eta -ne [string]$L.eta) { return $false }
         if (-not $jn -or [string]$jn.state -ne 'running' -or -not (Get-Process -Id ([int]$j.childPid) -ErrorAction SilentlyContinue)) { return $false }
         $jn.state = 'overrun'; $jn.ended = Now-Iso; $jn.why = "stopped by the cop at its overrun cap: $over"; Write-Job $jn
@@ -930,7 +954,7 @@ function Cap-Pass($Leases) {
         return $true
     }
     if (-not $marked) { return $out }
-    $gone = Lane-Break $j 'gpu'
+    $gone = Lane-Break $j $CardLease
     Stop-JobTree $j
     Cop-Note ([string]$j.by) "stopped your job $($j.id) at its overrun cap: $over.`r`n[THOR COP] The cap is 2 x -EstMin + $CapPadMin min. Submit it again with a true estimate; while a job runs, renew gpu -By $($L.by) -EstMin <n> moves its cap to 2 x n + $CapPadMin from then."
     $out += @{ job = $j.id; by = $L.by; stopped = $true; why = "$over$(if ($gone) { "; cancelled $gone" })" }
@@ -949,7 +973,7 @@ function Alarm-Pass($Leases) {
         if (-not $waiting) { continue }
         # A gpu job is the cap's. A job just stopped can keep its lease for a moment, until its runner lets go.
         $j = Lease-Job $L @('running', 'overrun', 'cancelled')
-        if ($j -and ($n -eq 'gpu' -or [string]$j.state -ne 'running')) { continue }
+        if ($j -and ($n -eq $CardLease -or [string]$j.state -ne 'running')) { continue }
         if ($CopMatch -and $(if ($j) { "$($j.exe) $($j.args)" } else { "$($L.by) $($L.note)" }) -notmatch $CopMatch) { continue }
         $tag = if ($j) { " job $($j.id)" } else { '' }
         $over = "held $([int]($now - (To-Utc $L.taken)).TotalMinutes) min on an estimate of $($L.est) min, past its cap $(Local-Hm $cap), $waiting waiting"
@@ -1081,16 +1105,16 @@ function Coverage($Procs, $Leases) {
         }
     }
     foreach ($p in $Procs) { $o = Lease-Of $p.pid $lp; if ($o) { $cov[$p.pid] = $o } }
-    $g = $Leases['gpu']
+    $g = $Leases[$CardLease]
     if ($g.state -eq 'live' -and -not $g.lease.pid) {
         $t0 = (To-Utc $g.lease.taken).AddSeconds(-60)
-        $cand = @($Procs | Where-Object { $_.kind -in @('game', 'packaged') -and -not $cov.ContainsKey($_.pid) -and $_.started -ge $t0 } |
+        $cand = @($Procs | Where-Object { $_.kind -in $Traits.leases[$CardLease].enforce -and -not $cov.ContainsKey($_.pid) -and $_.started -ge $t0 } |
             Sort-Object { -not (Is-Agent $_) }, started)
-        if ($cand.Count) { $cov[$cand[0].pid] = "gpu $($g.lease.by)" }
+        if ($cand.Count) { $cov[$cand[0].pid] = "$CardLease $($g.lease.by)" }
     }
-    foreach ($n in @('editor', 'build')) {
+    foreach ($n in $Names) {
         $x = $Leases[$n]
-        if ($x.state -eq 'live') { foreach ($p in $Procs) { if ($p.kind -eq $n -and -not $cov.ContainsKey($p.pid)) { $cov[$p.pid] = "$n $($x.lease.by)" } } }
+        if ($x.state -eq 'live') { foreach ($p in $Procs) { if ($p.kind -in $Traits.leases[$n].covers -and -not $cov.ContainsKey($p.pid)) { $cov[$p.pid] = "$n $($x.lease.by)" } } }
     }
     return $cov
 }
@@ -1111,9 +1135,9 @@ function Cop-Pass($Procs, $Leases) {
     # -CopMatch narrows the whole pass (coverage too), so a test never sees, or hands a pid-less lease to, a real run.
     $mine = @($Procs | Where-Object { -not $CopMatch -or $_.full -match $CopMatch })
     $cov = Coverage $mine $Leases
-    $g = $Leases['gpu']; $gl = if ($g.state -eq 'live') { $g.lease } else { $null }
-    $runs = @($mine | Where-Object { $_.kind -in @('game', 'packaged') } | Sort-Object started)
-    $uncov = @($runs | Where-Object { -not (Has-Lease ([string]$cov[$_.pid]) 'gpu') })
+    $g = $Leases[$CardLease]; $gl = if ($g.state -eq 'live') { $g.lease } else { $null }
+    $runs = @($mine | Where-Object { $_.kind -in $Traits.leases[$CardLease].enforce } | Sort-Object started)
+    $uncov = @($runs | Where-Object { -not (Has-Lease ([string]$cov[$_.pid]) $CardLease) })
     $allowed = $null
     if ($CopLenient -and -not $gl) { $allowed = @($uncov | Where-Object { Is-Agent $_ }) | Select-Object -First 1 }
     foreach ($p in $uncov) {
@@ -1133,7 +1157,7 @@ function Cop-Pass($Procs, $Leases) {
     }
     # C++ builds (UBT/UAT) without the build lease: a strike in lease.log, once per process, never stopped (a killed link
     # can leave broken binaries for everyone). cargo locks its own target dir, so it needs no lease.
-    foreach ($p in @($mine | Where-Object { $_.kind -eq 'build' -and $_.cpp })) {
+    foreach ($p in @($mine | Where-Object { $_.kind -in $StrikeKinds -and $_.cpp })) {
         if ($cov.ContainsKey($p.pid) -or $script:Struck.ContainsKey($p.pid)) { continue }
         if (-not (Is-StrikeBuild $p)) { continue }
         if (($now - $p.started).TotalSeconds -lt $CopGraceSec) { continue }
@@ -1683,10 +1707,12 @@ switch ($Verb) {
         $gpu = Get-Gpu; $procs = Get-Procs; $leases = Get-Leases
         $reasons = Quiet-Reasons $gpu $procs $leases
         if ($Json) {
+            $lj = [ordered]@{}; $qj = [ordered]@{}
+            foreach ($n in $Names) { $lj[$n] = $leases[$n]; $qj[$n] = @(Status-Queue $n $leases[$n]) }
             [ordered]@{
                 at = Now-Iso; gpu = $gpu
-                leases = [ordered]@{ editor = $leases['editor']; gpu = $leases['gpu']; build = $leases['build'] }
-                queues = [ordered]@{ editor = @(Status-Queue 'editor' $leases['editor']); gpu = @(Status-Queue 'gpu' $leases['gpu']); build = @(Status-Queue 'build' $leases['build']) }
+                leases = $lj
+                queues = $qj
                 procs = $procs; quiet = ($reasons.Count -eq 0); reasons = @($reasons)
             } | ConvertTo-Json -Depth 5
             exit 0
@@ -1791,7 +1817,7 @@ switch ($Verb) {
             if ($null -ne $procs) { try { foreach ($rp in (Reap-Pass $procs (Get-Leases))) { Say "released $($rp.lease) from $($rp.by): $($rp.why)" Yellow } } catch { Say "reap pass failed: $($_.Exception.Message)" Yellow } }
             try { foreach ($cj in (Cap-Pass (Get-Leases))) { Say "$(if ($cj.stopped) { 'stopped' } else { 'over its cap, not stopped:' }) job $($cj.job): $($cj.why)" Red } } catch { Say "cap pass failed: $($_.Exception.Message)" Yellow }
             try { foreach ($ca in (Alarm-Pass (Get-Leases))) { Say "over its cap, not stopped: $($ca.by)'s $($ca.lease) lease$(if ($ca.job) { " (job $($ca.job))" }): $($ca.why)" Red } } catch { Say "alarm pass failed: $($_.Exception.Message)" Yellow }
-            try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)$(if ($dj.lease -eq 'gpu') { " (cap ~$(Local-Hm (Job-CapAt $dj)))" })" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
+            try { foreach ($dj in (Dispatch-Pass)) { Say "dispatched $($dj.id): $($dj.exe) $($dj.args)$(if ($dj.lease -eq $CardLease) { " (cap ~$(Local-Hm (Job-CapAt $dj)))" })" Cyan } } catch { Say "dispatch pass failed: $($_.Exception.Message)" Yellow }
             if ($Once) { exit 0 }
             Start-Sleep -Seconds ([Math]::Max(2, $Every))
         }
@@ -1864,12 +1890,12 @@ switch ($Verb) {
     }
     'hold' {
         Need-By
-        if (-not $Lease) { $Lease = 'gpu' }
+        if (-not $Lease) { $Lease = $CardLease }
         $tie = if ($HolderPid) { $HolderPid } else { $PID }
         if (-not (Get-Process -Id $tie -ErrorAction SilentlyContinue)) { Fail "-HolderPid $tie is not running" }
         if ($Minutes -le 0) { $Minutes = 720 }
         $min = Lease-Minutes $Lease
-        $res = Wait-Lease $Lease $min $tie ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) ($Lease -eq 'gpu' -and -not $NoQuiet)
+        $res = Wait-Lease $Lease $min $tie ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) ($Lease -eq $CardLease -and -not $NoQuiet)
         if (-not $res.ok) { Fail $res.msg $res.code }
         Say "$Lease held: $(Describe-Lease $res.cur)" Green
         exit 0
@@ -1894,7 +1920,7 @@ switch ($Verb) {
         }
         Need-By
         if (-not $Exe) { Fail 'run needs -Exe <path> (and -ArgList for its arguments)' }
-        if (-not $Lease) { $Lease = 'gpu' }
+        if (-not $Lease) { $Lease = $CardLease }
         if ($Minutes -le 0) { $Minutes = 720 }
         $min = Lease-Minutes $Lease
         $res = Wait-Lease $Lease $min $PID ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) (-not $NoQuiet)
@@ -1918,7 +1944,7 @@ switch ($Verb) {
             Say "pid $($p.Id) exited $code"
         } finally {
             # A gpu job that ended past its cap on its own: its lane's queued jobs go first, while it still holds the lease (header: the cop).
-            if ($JobId -and $Lease -eq 'gpu') {
+            if ($JobId -and $Lease -eq $CardLease) {
                 try {
                     $cur = Read-Lease $Lease; $cap = Cap-At $cur; $jn = Read-Job $JobId
                     if ($cap -and [DateTime]::UtcNow -gt $cap -and $cur.by -eq $By -and [string]$jn.state -eq 'running') { [void](Lane-Break $jn $Lease) }
@@ -1937,12 +1963,12 @@ switch ($Verb) {
     }
     'submit' {
         Need-By
-        if (-not $Lease) { $Lease = 'gpu' }
+        if (-not $Lease) { $Lease = $CardLease }
         if (-not $Exe) { Fail 'submit needs -Exe <path> (and -ArgList for its arguments)' }
         if ($Quiet -and $NoQuiet) { Fail 'pick one: -Quiet (a timing run) or -NoQuiet' }
         # Quiet on the gpu lease is for timed work, so a gpu job asks for it: -Quiet, or one of quiet's switches. A job on another
         # lease keeps the wait: it's what keeps a build job off an open editor.
-        if ($Lease -eq 'gpu' -and -not @($script:BoundKeys | Where-Object { $_ -in @('Quiet', 'AllowEditor', 'AllowBuild', 'MaxVramGB', 'MaxUtil', 'SettleSec') }).Count) { $NoQuiet = $true }
+        if ($Lease -eq $CardLease -and -not @($script:BoundKeys | Where-Object { $_ -in @('Quiet', 'AllowEditor', 'AllowBuild', 'MaxVramGB', 'MaxUtil', 'SettleSec') }).Count) { $NoQuiet = $true }
         Do-Submit
     }
     'job' {
