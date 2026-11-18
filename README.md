@@ -8,12 +8,16 @@
   <img alt="MIT" src="https://img.shields.io/badge/license-MIT-66d48a">
 </p>
 
-**Thor is air-traffic control for a game-dev workstation that AI agents share.** Point three or four coding agents —
-Claude Code, Codex, Cursor, your own scripts — at one Unreal Engine project on one machine and they will happily launch
-two `-game` runs at once (every fps number is now garbage), close the editor you were working in, and kick off a C++
-build while another one is linking. Thor gives the contended resources — **the GPU, the editor, the C++ build** — real
-leases with a fair queue, starts queued jobs the moment their lease frees, enforces the rules with a cop, and puts the
-whole thing on a live terminal board so the human can see who's doing what.
+**Thor is air-traffic control for a Windows workstation that AI agents share.** Point three or four coding agents —
+Claude Code, Codex, Cursor, your own scripts — at one machine and they collide on whatever it has only one of: two `-game`
+runs at once (every fps number is now garbage), a training run that lands on a card a local model already fills, a C++
+build that links while another one launches, the editor you were working in closed under you. Thor gives the contended
+resources real leases with a fair queue, starts queued jobs the moment their lease frees, enforces the rules with a cop,
+and puts the whole thing on a live terminal board so the human can see who's doing what.
+
+It ships with an Unreal Engine preset, **the GPU, the editor, the C++ build**, because that's where it was born. A profile
+file swaps in your own leases and process kinds: `profiles\ml.json` sets up a model-and-training box with `gpu`, `build`
+and `bench`.
 
 One PowerShell file. No server, no service account, no database: state is a folder of JSON files guarded by a named mutex.
 
@@ -23,12 +27,15 @@ One PowerShell file. No server, no service account, no database: state is a fold
 
 | | |
 |---|---|
-| 🔒 **Leases** | `editor`, `gpu`, `build`. Advisory, file-backed, with an expiry and an estimate. Tie one to a process and it ends when the process dies — a crashed agent never strands the GPU. |
+| 🔒 **Leases** | `editor`, `gpu`, `build` in the preset, or whatever your profile names. Advisory, file-backed, with an expiry and an estimate. Tie one to a process and it ends when the process dies — a crashed agent never strands the GPU. |
 | 🧾 **A fair queue** | A take that finds the lease held joins its waitlist and gets told its place, its expected start, and when to check back. A freed lease is *kept* for the first in line who can use it now — no barging past anyone ready, and nobody blocked by a waiter who isn't. |
 | 🚀 **A dispatcher** | `submit` queues the *launch command itself*. When the lease frees, Thor starts it — no polling, no dead air between jobs. Exit code and stdout/stderr are kept for the agent to read later. |
 | ⏱️ **Re-estimates** | Running long? `renew -EstMin <minutes left>` moves your estimate, and everyone queued behind you gets the new time. |
 | 🤫 **Quiet-GPU gate** | Timed runs (fps, load times, frame costs) wait until the card is actually idle: no other lease, VRAM and load under a threshold, no editor, no shader compiles, no local LLM. They wait from the queue holding nothing, so a noisy card never blocks work that doesn't need it quiet. `run` and `hold` wait by default; a `gpu` job asks with `-Quiet`. |
 | 👮 **The cop** | Stops agent `-game`/packaged runs the gpu lease doesn't cover (after a 45 s grace) and tells the agent why in its own log. C++ builds without the build lease are logged as strikes, never killed. A lease left past its estimate with nothing running goes back once someone's waiting. Your own launches are never touched. |
+| 🧩 **Profiles** | The leases and the process kinds are a JSON table, not code. Keep the Unreal preset, start from `profiles\ml.json`, or write your own. |
+| 💤 **Idle probes** | A model server that stays up with nothing loaded isn't noise: Thor asks its status URL and believes the answer. No answer counts as busy. |
+| 📊 **Stats** | `stats` shows what jobs took against what they said they'd take, and `submit` flags an estimate that history says is too short. |
 | 📺 **The board** | Live, colour terminal view with a 90-minute timeline, strikes, and Windows toast alerts when leases change hands, jobs finish or the GPU goes quiet. |
 
 ## Quick start
@@ -207,6 +214,7 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `THOR_GAME_EXE` / `-GameExe` | `-Win64-(Shipping\|Development\|Test\|DebugGame).exe$` | regex for your packaged game's process name |
 | `THOR_AGENT_MARKERS` | — | extra regex that marks a command line as an agent's |
 | `THOR_SCRATCH` / `-ScratchDir` | — | per-agent folders; the cop drops `THOR_COP.txt` in `<dir>\<who>\` when it stops a run or job, releases a lease or raises the alarm. For all but a stopped run, `<who>` is the `-By` root, so `ci.art0` reads `<dir>\ci\` |
+| `THOR_JOB_DAYS` | `30` | days a finished job's json and logs are kept; `0` keeps them all |
 | `-ReapAfterMin` | `10` | minutes a lease stays idle past its estimate, with someone waiting, before the cop releases it; `0` turns that off |
 | `-ParkWarnMin` | `15` | minutes a wait for quiet runs before it logs `park-long`; then hourly |
 
@@ -231,12 +239,14 @@ verb with what is wrong. The board's row tags and some message wording still say
 - **A build job's only guard against an open editor is the quiet wait.** With an editor open, `submit build` waits; `-NoQuiet`
   skips that, and the link can then fail on a DLL the editor has loaded.
 - **VRAM is a card total** — Windows (WDDM) doesn't report video memory per process.
+- **Profiles are young.** The suite runs a non-Unreal profile's leases, kinds, jobs and probes, but the board's row tags and
+  some messages still say `gpu` and `editor`.
 - **One user.** Agents and the human run as the same Windows user; the state folder isn't an ACL boundary.
 
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 294 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 297 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the
