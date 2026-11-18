@@ -15,6 +15,7 @@
 #                    [-Quiet] [-NoQuiet] [-TimeoutMin 240] [-Json] (+ quiet's switches)
 #   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
 #   thor.ps1 stats   [-Days 14] [-By <who>] [-Json]
+#   every verb: [-Dir <state folder>] [-ProfilePath <profile.json>]
 #   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
 #   thor.ps1 quiet   [-By <who>] [-Wait] [-TimeoutMin 30] [-SettleSec 20] [-MaxVramGB 3.5] [-MaxUtil 50] [-AllowEditor] [-AllowBuild]
@@ -105,10 +106,15 @@
 # quits, t toggles alerts.
 # -Frame prints one coloured frame and exits (docs, CI). -Fixture replays fake processes and GPU readings (demo, tests).
 #
+# Profiles. The leases and the process kinds are a table, and the one built in is the Unreal preset. A profile file replaces it:
+# -ProfilePath <file>, else $env:THOR_PROFILE, else thor.profile.json beside this script; the word builtin as either forces the
+# preset. profiles\unreal.json is the preset as a file, and the comment above $Traits says what each trait does. Everything on
+# one state folder must use one profile: the dispatcher hands its own to the jobs it starts, the cop and the board need the same.
+#
 # Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first), 3 not quiet.
 param(
     [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats')][string]$Verb,
-    [Parameter(Position = 1)][ValidateSet('editor', 'gpu', 'build')][string]$Lease,
+    [Parameter(Position = 1)][string]$Lease,
     [string]$By,
     [string]$For = '',
     [int]$Minutes = 0,
@@ -154,11 +160,12 @@ param(
     [switch]$Frame,
     [int]$Cols = 150,
     [int]$Rows = 50,
-    [string]$Fixture = ''
+    [string]$Fixture = '',
+    [string]$ProfilePath = ''
 )
 $ErrorActionPreference = 'Stop'
 $script:BoundKeys = @($PSBoundParameters.Keys)
-# ---- the profile: leases and process kinds as data (this one is the Unreal preset) ---------------------------------------
+# ---- the profile: leases and process kinds as data (this one is the Unreal preset; a file can replace it) -----------------
 # The code below asks this table what a lease is and what a process is.
 # Lease traits: minutes = default expiry. busy = process kinds that count as the lease in use; busyCpp = kinds that count only
 #   when they are a C++ build. covers = kinds a live lease covers without a pid tie. strike = kinds logged as a strike when a
@@ -168,6 +175,7 @@ $script:BoundKeys = @($PSBoundParameters.Keys)
 # Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
 #   neverStop = it writes assets, so the overrun cap never stops a job with one in its tree.
 $Traits = @{
+    name = 'unreal'
     leases = [ordered]@{
         editor = @{ minutes = 120; busy = @('editor', 'commandlet'); busyCpp = @(); covers = @('editor'); strike = @() }
         gpu    = @{ minutes = 30; busy = @('game', 'packaged', 'llm', 'imagegen'); busyCpp = @(); covers = @(); strike = @(); card = $true; enforce = @('game', 'packaged') }
@@ -178,7 +186,7 @@ $Traits = @{
         @{ kind = 'commandlet'; name = '(?i)^UnrealEditor\.exe$'; cmd = '(?i)(^|\s)-run=' }
         @{ kind = 'game'; name = '(?i)^UnrealEditor\.exe$'; cmd = '(?i)(^|\s)-game(\s|$)' }
         @{ kind = 'editor'; name = '(?i)^UnrealEditor\.exe$' }
-        @{ kind = 'packaged'; name = $GameExe }
+        @{ kind = 'packaged'; name = '{GameExe}' }
         @{ kind = 'llm'; name = '(?i)^(llama-server|ollama_llama_server)' }
         @{ kind = 'llm'; name = '(?i)^ollama\.exe$'; cmd = '(?i)\srunner(\s|$)' }
         @{ kind = 'imagegen'; name = '(?i)^pythonw?\.exe$'; cmd = '(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen' }
@@ -196,7 +204,64 @@ $Traits = @{
         build      = @{ noise = 'build work: {name} pid {pid} (-AllowBuild to ignore)'; allow = 'AllowBuild' }
     }
 }
+function To-Hash($o) {
+    # ConvertFrom-Json's objects as ordered hashtables (Windows PowerShell 5.1 has no -AsHashtable). Arrays stay arrays, even of one.
+    if ($null -eq $o -or $o -is [string] -or $o -is [ValueType]) { return $o }
+    if ($o -is [Collections.IEnumerable] -and $o -isnot [Collections.IDictionary]) { return , @($o | ForEach-Object { To-Hash $_ }) }
+    $h = [ordered]@{}; foreach ($pr in $o.PSObject.Properties) { $h[$pr.Name] = To-Hash $pr.Value }
+    return $h
+}
+function Read-Profile([string]$Path) {
+    # A profile file as the table, checked: a bad one stops here with what is wrong, before any lease is touched.
+    $bad = { param($m) Write-Host "thor: profile $Path`: $m" -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { & $bad 'file not found' }
+    try { $t = To-Hash ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $Path).Path) | ConvertFrom-Json) } catch { & $bad "not valid JSON: $($_.Exception.Message)" }
+    if ($t -isnot [Collections.IDictionary] -or $t.leases -isnot [Collections.IDictionary] -or -not $t.leases.Count) { & $bad 'it needs a "leases" object with at least one lease' }
+    if (-not $t.name) { $t.name = [IO.Path]::GetFileNameWithoutExtension($Path) }
+    foreach ($n in @($t.leases.Keys)) {
+        if ($n -cnotmatch '^[a-z][a-z0-9_-]{0,15}$') { & $bad "lease '$n': a name is lower-case letters, digits, _ or -, at most 16, starting with a letter" }
+        if ($t.leases[$n] -isnot [Collections.IDictionary]) { & $bad "lease '$n' must be an object" }
+        $m = $t.leases[$n].minutes
+        if ($null -ne $m -and ($m -isnot [ValueType] -or $m -lt 1 -or $m -gt 720)) { & $bad "lease '$n': minutes is a number from 1 to 720" }
+    }
+    if (@($t.leases.Keys | Where-Object { $t.leases[$_].card }).Count -ne 1) { & $bad 'exactly one lease must have "card": true (the lease the GPU reading gates)' }
+    if ($null -eq $t.rules) { $t.rules = @() }
+    if ($t.rules -is [Collections.IDictionary]) { & $bad '"rules" must be an array' }
+    $i = 0
+    foreach ($r in @($t.rules)) {
+        $i++
+        if ($r -isnot [Collections.IDictionary] -or [string]$r.kind -cnotmatch '^[a-z][a-z0-9_-]{0,15}$' -or -not [string]$r.name) { & $bad "rule $i needs a kind (a lower-case word) and a name (a regex on the process name)" }
+        foreach ($f in @('name', 'cmd')) {
+            if ($r[$f] -and [string]$r[$f] -ne '{GameExe}') { try { [void][regex]::new([string]$r[$f]) } catch { & $bad "rule $i ($($r.kind)): $f is not a regex: $($_.Exception.InnerException.Message)" } }
+        }
+    }
+    if ($null -eq $t.kinds) { $t.kinds = [ordered]@{} }
+    if ($t.kinds -isnot [Collections.IDictionary]) { & $bad '"kinds" must be an object' }
+    foreach ($k in @($t.kinds.Keys)) {
+        if ($t.kinds[$k] -isnot [Collections.IDictionary]) { & $bad "kind '$k' must be an object" }
+        if ($t.kinds[$k].allow -and [string]$t.kinds[$k].allow -notin @('AllowEditor', 'AllowBuild')) { & $bad "kind '$k': allow is AllowEditor or AllowBuild" }
+    }
+    return $t
+}
+# Which profile: -ProfilePath, else $env:THOR_PROFILE, else thor.profile.json beside this script. The word builtin keeps the preset above.
+$ProfileArg = if ($ProfilePath) { $ProfilePath } elseif ($env:THOR_PROFILE) { [string]$env:THOR_PROFILE } else { '' }
+if (-not $ProfileArg -and $PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'thor.profile.json') -PathType Leaf)) { $ProfileArg = Join-Path $PSScriptRoot 'thor.profile.json' }
+if ($ProfileArg -and $ProfileArg -ne 'builtin') {
+    $Traits = Read-Profile $ProfileArg
+    $ProfileArg = (Resolve-Path -LiteralPath $ProfileArg).Path
+}
+foreach ($n in @($Traits.leases.Keys)) {
+    $lt = $Traits.leases[$n]
+    if ($null -eq $lt.minutes) { $lt.minutes = 60 }
+    foreach ($f in @('busy', 'busyCpp', 'covers', 'strike', 'enforce')) { $lt[$f] = @($lt[$f] | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+}
+foreach ($r in @($Traits.rules)) { if ([string]$r.name -eq '{GameExe}') { $r.name = $GameExe } }
 $Names = @($Traits.leases.Keys)
+if ($Lease) {
+    $known = [string]($Names | Where-Object { $_ -eq $Lease } | Select-Object -First 1)
+    if (-not $known) { Write-Host "thor: no lease '$Lease' in this profile ($($Traits.name)): name one of $($Names -join ', ')" -ForegroundColor Red; exit 1 }
+    $Lease = $known
+}
 $CardLease = [string]($Names | Where-Object { $Traits.leases[$_].card } | Select-Object -First 1)
 $NeverStop = @($Traits.kinds.Keys | Where-Object { $Traits.kinds[$_].neverStop })
 $StrikeKinds = @($Names | ForEach-Object { $Traits.leases[$_].strike } | Where-Object { $_ } | Select-Object -Unique)
@@ -600,7 +665,8 @@ function Dispatch-Pass {
         if ($host1 -notmatch '(?i)pwsh\.exe$|powershell\.exe$') { $host1 = (Get-Command pwsh -ErrorAction SilentlyContinue).Source }
         # Detached through WMI under a headless console: no window, and no inherited pipes, so a `submit` that starts a job at
         # once returns at once (a plain child would hold the caller's output pipe open until the job ended).
-        $cl = "`"$(Join-Path $env:SystemRoot 'System32\conhost.exe')`" --headless `"$host1`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$PSCommandPath`" run $nm -By $($go.runBy) -JobId $($go.id) -Dir `"$Dir`""
+        $pf = if ($ProfileArg) { ' -ProfilePath "' + $ProfileArg + '"' } else { '' }
+        $cl = "`"$(Join-Path $env:SystemRoot 'System32\conhost.exe')`" --headless `"$host1`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$PSCommandPath`" run $nm -By $($go.runBy) -JobId $($go.id) -Dir `"$Dir`"$pf"
         $ca = @{ CommandLine = $cl }
         if ($go.cwd -and (Test-Path -LiteralPath $go.cwd)) { $ca.CurrentDirectory = [string]$go.cwd }
         try {
@@ -1766,7 +1832,7 @@ switch ($Verb) {
             $lj = [ordered]@{}; $qj = [ordered]@{}
             foreach ($n in $Names) { $lj[$n] = $leases[$n]; $qj[$n] = @(Status-Queue $n $leases[$n]) }
             [ordered]@{
-                at = Now-Iso; gpu = $gpu
+                at = Now-Iso; profile = [string]$Traits.name; gpu = $gpu
                 leases = $lj
                 queues = $qj
                 procs = $procs; quiet = ($reasons.Count -eq 0); reasons = @($reasons)

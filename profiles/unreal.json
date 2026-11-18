@@ -1,0 +1,124 @@
+{
+  "name": "unreal",
+  "leases": {
+    "editor": {
+      "minutes": 120,
+      "busy": [
+        "editor",
+        "commandlet"
+      ],
+      "covers": [
+        "editor"
+      ]
+    },
+    "gpu": {
+      "minutes": 30,
+      "card": true,
+      "busy": [
+        "game",
+        "packaged",
+        "llm",
+        "imagegen"
+      ],
+      "enforce": [
+        "game",
+        "packaged"
+      ]
+    },
+    "build": {
+      "minutes": 60,
+      "busy": [
+        "commandlet"
+      ],
+      "busyCpp": [
+        "build"
+      ],
+      "covers": [
+        "build"
+      ],
+      "strike": [
+        "build"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "kind": "commandlet",
+      "name": "(?i)^UnrealEditor-Cmd\\.exe$"
+    },
+    {
+      "kind": "commandlet",
+      "name": "(?i)^UnrealEditor\\.exe$",
+      "cmd": "(?i)(^|\\s)-run="
+    },
+    {
+      "kind": "game",
+      "name": "(?i)^UnrealEditor\\.exe$",
+      "cmd": "(?i)(^|\\s)-game(\\s|$)"
+    },
+    {
+      "kind": "editor",
+      "name": "(?i)^UnrealEditor\\.exe$"
+    },
+    {
+      "kind": "packaged",
+      "name": "{GameExe}"
+    },
+    {
+      "kind": "llm",
+      "name": "(?i)^(llama-server|ollama_llama_server)"
+    },
+    {
+      "kind": "llm",
+      "name": "(?i)^ollama\\.exe$",
+      "cmd": "(?i)\\srunner(\\s|$)"
+    },
+    {
+      "kind": "imagegen",
+      "name": "(?i)^pythonw?\\.exe$",
+      "cmd": "(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen"
+    },
+    {
+      "kind": "build",
+      "name": "(?i)^(UnrealBuildTool|AutomationTool)\\.exe$",
+      "cpp": true
+    },
+    {
+      "kind": "build",
+      "name": "(?i)^(ShaderCompileWorker|cargo|rustc)\\.exe$"
+    },
+    {
+      "kind": "build",
+      "name": "(?i)^dotnet\\.exe$",
+      "cmd": "(?i)UnrealBuildTool|AutomationTool",
+      "cpp": true
+    }
+  ],
+  "kinds": {
+    "llm": {
+      "noise": "local LLM loaded: {name} pid {pid}"
+    },
+    "imagegen": {
+      "noise": "image generation: {name} pid {pid}"
+    },
+    "game": {
+      "noise": "-game run: pid {pid} {cmd}"
+    },
+    "packaged": {
+      "noise": "packaged game: {name} pid {pid}"
+    },
+    "commandlet": {
+      "noise": "commandlet: pid {pid} {cmd}",
+      "neverStop": true
+    },
+    "editor": {
+      "noise": "editor open: pid {pid} {cmd} (-AllowEditor to ignore)",
+      "allow": "AllowEditor",
+      "neverStop": true
+    },
+    "build": {
+      "noise": "build work: {name} pid {pid} (-AllowBuild to ignore)",
+      "allow": "AllowBuild"
+    }
+  }
+}

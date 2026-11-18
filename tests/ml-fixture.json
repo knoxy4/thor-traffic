@@ -1,0 +1,51 @@
+{
+  "gpu": {
+    "usedMB": 900,
+    "totalMB": 12288,
+    "util": 3
+  },
+  "procs": [
+    {
+      "pid": 201,
+      "ppid": 4,
+      "name": "python.exe",
+      "agoSec": 600,
+      "cmd": "python.exe train.py --epochs 3"
+    },
+    {
+      "pid": 202,
+      "ppid": 4,
+      "name": "python.exe",
+      "agoSec": 600,
+      "cmd": "python.exe ComfyUI\\main.py"
+    },
+    {
+      "pid": 203,
+      "ppid": 4,
+      "name": "UnrealEditor.exe",
+      "agoSec": 600,
+      "cmd": "UnrealEditor.exe Outpost.uproject -game"
+    },
+    {
+      "pid": 204,
+      "ppid": 4,
+      "name": "cargo.exe",
+      "agoSec": 600,
+      "cmd": "cargo.exe build"
+    },
+    {
+      "pid": 205,
+      "ppid": 4,
+      "name": "ollama.exe",
+      "agoSec": 600,
+      "cmd": "ollama.exe runner --model m"
+    },
+    {
+      "pid": 206,
+      "ppid": 4,
+      "name": "python.exe",
+      "agoSec": 600,
+      "cmd": "python.exe report.py"
+    }
+  ]
+}

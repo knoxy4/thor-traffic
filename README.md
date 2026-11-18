@@ -134,6 +134,37 @@ Two rules keep the queue honest:
 Agent markers the cop understands out of the box: `-ExecCmds=`, `-abslog=`, `-log=`, `-ResX=`, `bRemoteExecution=False`,
 or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the process tree. Add yours with `$env:THOR_AGENT_MARKERS`.
 
+## Profiles
+
+Thor started on an Unreal box, and the Unreal rules are still what you get out of the box. They are a table, though, not
+code: which leases exist, which processes count as what, which of them make the GPU noisy. A profile file swaps the table.
+
+```powershell
+.\thor.ps1 status -ProfilePath .\profiles\ml.json      # one call
+$env:THOR_PROFILE = 'C:\tools\thor\profiles\ml.json'   # this shell
+Copy-Item .\profiles\ml.json .\thor.profile.json       # everything that runs this copy of thor.ps1
+```
+
+`profiles\unreal.json` is the built-in preset as a file, to copy and edit. `profiles\ml.json` is a small one for a box that
+trains and serves models: a `gpu` lease, a `build` lease, and a plain `bench` lease that is nothing but a named turn.
+
+| in the file | means |
+|---|---|
+| `leases.<name>.minutes` | default expiry |
+| `leases.<name>.card` | `true` on exactly one lease: the one the GPU reading gates, the default lease, the one whose jobs are capped |
+| `leases.<name>.busy`, `busyCpp` | process kinds that count as the lease in use, so the cop doesn't take it back (`busyCpp`: only rules marked `cpp`) |
+| `leases.<name>.covers` | kinds a live lease covers without a pid tie |
+| `leases.<name>.enforce` | on the card lease: kinds the cop stops when an agent runs one uncovered |
+| `leases.<name>.strike` | kinds logged as a strike when a `cpp` one runs without the lease |
+| `rules[]` | first match wins: `kind`, `name` (regex on the process name), optional `cmd` (regex on the command line), optional `cpp` |
+| `kinds.<kind>.noise` | the line `quiet` gives for it, with `{name}`, `{pid}`, `{cmd}`; a kind with no `noise` never makes the GPU noisy |
+| `kinds.<kind>.allow` | `AllowEditor` or `AllowBuild`: the switch that ignores it |
+| `kinds.<kind>.neverStop` | it writes files that a kill would corrupt, so the cap never stops a job with one in its tree |
+
+Everything on one state folder has to use one profile. The dispatcher hands its own to the jobs it starts; give the cop
+and the board the same one, or put `thor.profile.json` beside `thor.ps1` and they all find it. A bad profile stops every
+verb with what is wrong. The board's row tags and some message wording still say Unreal things under another profile.
+
 ## Command reference
 
 | verb | what it does |
@@ -171,6 +202,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 | variable / flag | default | |
 |---|---|---|
 | `THOR_DIR` / `-Dir` | `%ProgramData%\ThorTraffic` | where leases, queues, jobs and the log live |
+| `THOR_PROFILE` / `-ProfilePath` | the Unreal preset | a profile file: your own leases and process kinds (see Profiles); `builtin` forces the preset |
 | `THOR_GAME_EXE` / `-GameExe` | `-Win64-(Shipping\|Development\|Test\|DebugGame).exe$` | regex for your packaged game's process name |
 | `THOR_AGENT_MARKERS` | — | extra regex that marks a command line as an agent's |
 | `THOR_SCRATCH` / `-ScratchDir` | — | per-agent folders; the cop drops `THOR_COP.txt` in `<dir>\<who>\` when it stops a run or job, releases a lease or raises the alarm. For all but a stopped run, `<who>` is the `-By` root, so `ci.art0` reads `<dir>\ci\` |
@@ -203,7 +235,7 @@ or a known agent host (`claude`, `codex`, `cursor-agent`, `aider`) up the proces
 ## Tests
 
 ```powershell
-pwsh .\tests\run-tests.ps1     # 280 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
+pwsh .\tests\run-tests.ps1     # 287 end-to-end checks in a throwaway state folder, about 15 min; no GPU needed
 ```
 
 CI runs the same suite on `windows-latest`. It includes `tests\quiet-wait-tests.ps1`, which stubs the GPU reading and the

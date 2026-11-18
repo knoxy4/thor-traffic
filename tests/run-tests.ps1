@@ -2,6 +2,7 @@
 # rendered from demo\fixture.json, and quiet-wait-tests.ps1 stubs the GPU. Usage: pwsh tests\run-tests.ps1 [-Shell pwsh|powershell] [-Keep]
 param([string]$Shell = 'pwsh', [switch]$Keep)
 $ErrorActionPreference = 'Stop'
+$env:THOR_PROFILE = 'builtin'   # the suite tests the preset, whatever thor.profile.json sits beside the tool
 $root = Split-Path -Parent $PSScriptRoot
 $thor = Join-Path $root 'thor.ps1'
 $D = Join-Path ([IO.Path]::GetTempPath()) ("thor-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -134,6 +135,26 @@ try {
     $qo = (& $Shell -NoProfile -File $thor quiet -AllowEditor -AllowBuild -Dir $DD -Fixture $kf 2>&1 | ForEach-Object { "$_" }) -join "`n"; $script:out = $qo
     Check 'kinds: -AllowEditor and -AllowBuild drop only their kinds' ($LASTEXITCODE -eq 3 -and $qo -notmatch 'editor open' -and $qo -notmatch 'build work' -and $qo -match 'commandlet: pid 101' -and $qo -match 'local LLM loaded')
     Check 'status -Json lists the leases in table order' (@($ks.leases.PSObject.Properties.Name) -join ',' -eq 'editor,gpu,build' -and @($ks.queues.PSObject.Properties.Name) -join ',' -eq 'editor,gpu,build')
+    # --- profiles: the table from a file
+    $up = Join-Path $root 'profiles\unreal.json'; $mp = Join-Path $root 'profiles\ml.json'; $PD = "$D-ml"
+    $flat = { param($o) (@($o.procs | Sort-Object pid | ForEach-Object { "$($_.pid)=$($_.kind)$(if ($_.cpp) { '+cpp' })" }) + @($o.reasons) + @(@($o.leases.PSObject.Properties.Name) -join ',')) -join "`n" }
+    $us = & $Shell -NoProfile -File $thor status -Json -Dir $DD -Fixture $kf -ProfilePath $up | ConvertFrom-Json
+    $script:out = & $flat $us
+    Check 'profiles: unreal.json is the built-in table' ((& $flat $us) -ceq (& $flat $ks) -and $us.profile -eq 'unreal' -and $ks.profile -eq 'unreal')
+    function TP { $o = & $Shell -NoProfile -ExecutionPolicy Bypass -File $thor @args -Dir $PD -ProfilePath $mp 2>&1 | ForEach-Object { "$_" }; $script:out = $o -join "`n"; return $LASTEXITCODE }
+    $ms = & $Shell -NoProfile -File $thor status -Json -Dir $PD -ProfilePath $mp -Fixture (Join-Path $PSScriptRoot 'ml-fixture.json') | ConvertFrom-Json
+    $script:out = & $flat $ms
+    Check 'profiles: a profile names its own leases' ($ms.profile -eq 'ml' -and @($ms.leases.PSObject.Properties.Name) -join ',' -eq 'gpu,build,bench')
+    Check 'profiles: and its own kinds' ((@($ms.procs | Sort-Object pid | ForEach-Object { "$($_.pid)=$($_.kind)$(if ($_.cpp) { '+cpp' })" }) -join ' ') -eq '201=train 202=imagegen 204=compile+cpp 205=llm' -and (@($ms.reasons) -join ';') -match 'training run: python\.exe pid 201')
+    Check 'profiles: a lease the profile lacks is refused' ((TP take editor -By p1) -eq 1 -and $out -match "no lease 'editor' in this profile \(ml\): name one of gpu, build, bench")
+    Check 'profiles: a lease only the profile has is taken and released' ((TP take bench -By p1 -EstMin 5) -eq 0 -and (TP release bench -By p1) -eq 0)
+    [void](TP submit bench -By p1 -Exe cmd.exe -ArgList '/c exit 0' -For 'profile job' -EstMin 1 -NoQuiet)
+    $pid1 = LastId; $pj = $null; $tEnd = [DateTime]::UtcNow.AddSeconds(40)
+    while ([DateTime]::UtcNow -lt $tEnd) { $pj = & $Shell -NoProfile -File $thor job -JobId $pid1 -Json -Dir $PD -ProfilePath $mp | ConvertFrom-Json; if ([string]$pj.state -in @('done', 'failed', 'lost')) { break }; Start-Sleep -Milliseconds 700 }
+    $script:out = $pj | ConvertTo-Json
+    Check 'profiles: the dispatcher hands its profile to the job it starts' ($pj.state -eq 'done' -and $pj.lease -eq 'bench')
+    $o = & $Shell -NoProfile -File $thor status -Dir $PD -ProfilePath (Join-Path $PSScriptRoot 'bad-profile.json') 2>&1 | ForEach-Object { "$_" }; $bx = $LASTEXITCODE; $script:out = $o -join "`n"
+    Check 'profiles: a bad profile stops with what is wrong' ($bx -eq 1 -and $out -match 'exactly one lease must have "card": true')
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
     foreach ($suite in @('quiet-wait', 'cap')) {
         $qp = 0; $qf = 0
@@ -143,7 +164,7 @@ try {
         if ($qx -and -not $qf) { $script:out = "$suite-tests.ps1 stopped before its end"; Check "$suite suite ran to its end" $false }
     }
 } finally {
-    if (-not $Keep) { Start-Sleep -Seconds 1; Remove-Item $D, "$D-demo" -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $Keep) { Start-Sleep -Seconds 1; Remove-Item $D, "$D-demo", "$D-ml" -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Write-Host ""
 Write-Host "$pass passed, $fail failed" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })

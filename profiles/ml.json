@@ -1,0 +1,71 @@
+{
+  "name": "ml",
+  "leases": {
+    "gpu": {
+      "minutes": 30,
+      "card": true,
+      "busy": [
+        "llm",
+        "imagegen",
+        "train"
+      ],
+      "enforce": []
+    },
+    "build": {
+      "minutes": 60,
+      "busyCpp": [
+        "compile"
+      ],
+      "covers": [
+        "compile"
+      ],
+      "strike": [
+        "compile"
+      ]
+    },
+    "bench": {
+      "minutes": 20
+    }
+  },
+  "rules": [
+    {
+      "kind": "llm",
+      "name": "(?i)^(llama-server|ollama_llama_server)"
+    },
+    {
+      "kind": "llm",
+      "name": "(?i)^ollama\\.exe$",
+      "cmd": "(?i)\\srunner(\\s|$)"
+    },
+    {
+      "kind": "imagegen",
+      "name": "(?i)^pythonw?\\.exe$",
+      "cmd": "(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen"
+    },
+    {
+      "kind": "train",
+      "name": "(?i)^pythonw?\\.exe$",
+      "cmd": "(?i)\\btrain|finetune|fine_tune|lora|accelerate"
+    },
+    {
+      "kind": "compile",
+      "name": "(?i)^(cl|link|msbuild|cmake|ninja|cargo|rustc)\\.exe$",
+      "cpp": true
+    }
+  ],
+  "kinds": {
+    "llm": {
+      "noise": "local LLM loaded: {name} pid {pid}"
+    },
+    "imagegen": {
+      "noise": "image generation: {name} pid {pid}"
+    },
+    "train": {
+      "noise": "training run: {name} pid {pid} {cmd}"
+    },
+    "compile": {
+      "noise": "compile work: {name} pid {pid} (-AllowBuild to ignore)",
+      "allow": "AllowBuild"
+    }
+  }
+}
