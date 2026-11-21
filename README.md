@@ -39,6 +39,7 @@ One PowerShell file. No server, no service account, no database: state is a fold
 | 🔔 **Sinks** | The cop hands every lease.log line to your hooks (any command, the event in `THOR_*` env vars), to a webhook, and with `cop -Toast` to Windows toasts, so alerts don't need a board open. |
 | 🕓 **Later and first** | `submit -NotBefore 02:00` queues a job for tonight without holding anyone up; `-Priority` puts urgent work ahead; a `-Preemptible` job steps aside for it and goes back in line. |
 | 🛂 **Check and MCP** | `check` tells an agent, before it launches something, which lease that command needs and whether it holds it. `mcp\thor-mcp.ps1` serves the verbs as MCP tools on stdio. |
+| 🌌 **A wallpaper** | A Wallpaper Engine scene with a live status panel: system meters, leases, jobs, services. [More below](#thor-night-wallpaper). |
 | 📺 **The board** | Live, colour terminal view with a 90-minute timeline, strikes, and Windows toast alerts when leases change hands, jobs finish or the GPU goes quiet. |
 
 ## Quick start
@@ -225,6 +226,31 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `THOR_JOB_DAYS` | `30` | days a finished job's json and logs are kept; `0` keeps them all |
 | `-ReapAfterMin` | `10` | minutes a lease stays idle past its estimate, with someone waiting, before the cop releases it; `0` turns that off |
 | `-ParkWarnMin` | `15` | minutes a wait for quiet runs before it logs `park-long`; then hourly |
+
+## Thor Night wallpaper
+
+<p align="center"><img src="docs/img/wallpaper.jpg" alt="The Thor Night wallpaper: a starfield over radio telescopes, a clock, and a panel with CPU, RAM, GPU and VRAM meters, the Thor leases, queued jobs, sessions, services and free disk space (demo data)" width="100%"></p>
+
+The board lives in a terminal; the wallpaper puts the same picture on your desktop. `wallpaper\` is a
+[Wallpaper Engine](https://store.steampowered.com/app/431960/Wallpaper_Engine/) web wallpaper in three scenes (Sky,
+Valley, Tower) with a clock, slow effects and, on Sky, a status panel: CPU, RAM, GPU and VRAM, who holds each lease and how
+long they have left, queued jobs, which local services answer, and free disk space.
+
+The panel reads `thor_hud.py`, a small stdlib-only Python feed on `127.0.0.1` that reads the Thor state folder, `nvidia-smi`
+and the system counters. It answers only with the token in `wallpaper\hud_token.txt`, made on first run and never committed.
+
+```powershell
+.\wallpaper\install-wallpaper.ps1 -StartHud -HudArgs '--services OLLAMA=11434,COMFY=8188 --disks C,D'   # build the scenes, start the feed at logon
+.\wallpaper\install-wallpaper.ps1 -Apply -Monitor @{ sky = 0; valley = 1 }                              # put scenes on monitors
+python .\wallpaper\thor_hud.py --demo                                                                   # made-up data, as in the screenshot
+```
+
+The installer finds Wallpaper Engine through your Steam library folders (`-WallpaperEngine` overrides it), builds
+`thor_sky`, `thor_valley` and `thor_tower` into its `myprojects` folder, and writes each scene's `cfg.js`. Lease names
+follow `-Leases` (default `gpu, editor, build`), so match them to your profile. The SESSIONS strip appears only when the
+state folder has a `sessions\` directory, which `thor.ps1` itself doesn't write. The panel uses Bahnschrift, which ships
+with Windows 10 and 11. The background images were generated for this project with FLUX.2 klein (Apache 2.0) and are
+covered by the repo's MIT license.
 
 ## Honest limits
 
