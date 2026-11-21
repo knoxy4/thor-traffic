@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/banner.png" alt="Thor Traffic Control" width="100%"></p>
+<p align="center"><img src="docs/img/banner.jpg" alt="Thor Traffic Control" width="100%"></p>
 
 <p align="center">
   <img alt="PowerShell 7" src="https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white">
