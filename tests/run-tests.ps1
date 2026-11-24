@@ -250,7 +250,7 @@ try {
     Check 'prune: an old unfinished job and a fresh one stay' ((Test-Path (Join-Path $jd 'old-run.json')) -and (Test-Path (Join-Path $jd 'new-done.json')))
     Check 'prune: it is logged' ((Get-Content (Join-Path $D 'lease.log') -Raw) -match 'prune jobs - 1 finished jobs older than 30 days')
     # --- waiting for a quiet GPU holds nothing, and the overrun cap and alarm (their own scripts: they stub the GPU in a copy of thor.ps1)
-    foreach ($suite in @('quiet-wait', 'cap')) {
+    foreach ($suite in @('quiet-wait', 'cap', 'fix')) {
         $qp = 0; $qf = 0
         & $Shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "$suite-tests.ps1") -Shell $Shell | ForEach-Object { Write-Host $_; if ($_ -like 'PASS *') { $qp++ } elseif ($_ -like 'FAIL *') { $qf++ } }
         $qx = $LASTEXITCODE

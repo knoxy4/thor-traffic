@@ -31,8 +31,11 @@ $Tools = [ordered]@{
     thor_stats   = @{ verb = 'stats'; fixed = @('-Json'); schema = (Schema ([ordered]@{ days = $N; by = $S }))
         desc = 'What jobs took against what they said they would, per kind of job.' }
 }
-$Out = [Console]::Out
+# UTF-8 first, then the writer: a writer taken before keeps the console's old code page. THOR_UTF8 makes each thor.ps1 child
+# write UTF-8 too, since a hidden console would hand it the OEM code page.
 try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false; [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch {}
+$Out = [Console]::Out
+$env:THOR_UTF8 = '1'
 function Send($Msg) { $Out.WriteLine(($Msg | ConvertTo-Json -Depth 12 -Compress)); $Out.Flush() }
 function Reply($Id, $Result) { Send ([ordered]@{ jsonrpc = '2.0'; id = $Id; result = $Result }) }
 function Refuse($Id, [int]$Code, [string]$Text) { Send ([ordered]@{ jsonrpc = '2.0'; id = $Id; error = [ordered]@{ code = $Code; message = $Text } }) }
@@ -41,12 +44,27 @@ function Call-Thor([string]$Name, $Arguments) {
     $given = @{}; if ($Arguments) { foreach ($pr in $Arguments.PSObject.Properties) { $given[$pr.Name] = $pr.Value } }
     foreach ($r in @($t.schema.required)) { if ($r -and ($null -eq $given[$r] -or "$($given[$r])" -eq '')) { return @{ text = "missing argument: $r"; bad = $true } } }
     $al = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Thor, $t.verb)
-    if ($given.ContainsKey('lease') -and "$($given.lease)") { $al += [string]$given.lease }
+    if ($given.ContainsKey('lease') -and "$($given.lease)") {
+        if ("$($given.lease)" -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,15}$') { return @{ text = "lease '$($given.lease)' is not a lease name"; bad = $true } }
+        $al += [string]$given.lease
+    }
     foreach ($k in $t.schema.properties.Keys) {
         if ($k -eq 'lease' -or -not $given.ContainsKey($k) -or $null -eq $given[$k]) { continue }
         $v = $given[$k]
-        if ($t.schema.properties[$k].type -eq 'boolean') { if ([bool]$v) { $al += "-$k" } }
-        else { $al += "-$k"; $al += [string]$v }
+        if ($t.schema.properties[$k].type -eq 'boolean') {
+            # A real JSON boolean, or the words true/false: a string "false" is truthy to PowerShell, and here it could cancel a job.
+            if ($v -is [bool]) { $on = $v }
+            elseif ("$v" -match '^(?i:true|false)$') { $on = "$v" -ieq 'true' }
+            else { return @{ text = "$k must be true or false, not '$v'"; bad = $true } }
+            if ($on) { $al += "-$k" }
+            continue
+        }
+        # ConvertFrom-Json turns an ISO time into a DateTime, whose plain [string] has no zone: hand it on as ISO, in UTC.
+        if ($v -is [datetime]) { $v = $v.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.FFFFFFFZ', [Globalization.CultureInfo]::InvariantCulture) }
+        elseif ($v -is [double] -or $v -is [decimal] -or $v -is [single]) { $v = ([double]$v).ToString([Globalization.CultureInfo]::InvariantCulture) }
+        if ("$v" -eq '') { continue }
+        # -name:value as one argument, so a value that starts with a dash (argList "-game") stays a value.
+        $al += "-$k`:$v"
     }
     $al += @($t.fixed | Where-Object { $_ })
     if ($Dir) { $al += @('-Dir', $Dir) }

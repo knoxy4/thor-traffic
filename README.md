@@ -99,7 +99,8 @@ flowchart LR
   `jobs\*.json` and an append-only `lease.log`. Every read-modify-write happens under one named mutex, so two takes can
   never both win — and nothing blocks while holding it.
 - **Leases are files, not mutexes**, because an agent's tool call lives a few seconds and can't hold a handle. A lease has
-  an expiry and, optionally, a process: `run`, `hold` and dispatched jobs tie the lease to themselves, so it ends when they do.
+  an expiry and, optionally, a process: `run`, `hold` and dispatched jobs tie the lease to themselves, so it ends when they do —
+  and not before: a tied lease outlives its expiry while its process runs (the cop's cap, alarm and reaper handle one that overstays).
 - **Coverage** follows the process tree: the cop and the board treat the lease's process, its child, and every descendant
   as covered. One launcher can hold `build` + `gpu` at once.
 - **Jobs run detached** (WMI-created, headless console, no inherited handles), so `submit` returns immediately even when
