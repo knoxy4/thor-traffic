@@ -138,6 +138,30 @@ try {
     [void](T release build -By outer); [void](T take build -By outer -HolderPid $sib.Id)
     Check 'a take from outside the holder''s tree still queues' ((T take build -By inner -NoQueue) -eq 2)
 
+    # One name, two processes: a second process under a held name is refused, not handed the first one's tie
+    $script:D = New-Dir 'onename'
+    $p1 = Sleeper; $p2 = Sleeper
+    [void](T take gpu -By dup -HolderPid $p1.Id)
+    Check 'a second process under the same -By is refused' ((T take gpu -By dup -HolderPid $p2.Id) -eq 2 -and $out -match 'another process')
+    Check 'the first keeps its tie' ([int](Status).leases.gpu.lease.pid -eq $p1.Id)
+    Check 'the same holder renewing still works' ((T renew gpu -By dup) -eq 0)
+
+    # A build job waits for the editor, not for image generation or the card's load
+    $script:D = New-Dir 'offcard'
+    $fx2 = Join-Path $base 'offcard-fixture.json'
+    Put $fx2 @{ gpu = @{ usedMB = 11000; totalMB = 12288; util = 99 }; procs = @(@{ pid = 9101; ppid = 4; name = 'python.exe'; cmd = 'python.exe ComfyUI\main.py'; agoSec = 600 }) }
+    $rc = T run build -By ob -Exe cmd.exe -ArgList '/c exit 0' -TimeoutMin 0.5 -SettleSec 1 -Fixture $fx2
+    Check 'a build run is not held up by GPU noise' ($rc -eq 0 -and $out -match 'started pid')
+
+    # A launcher holding gpu under its name runs its next step: covered, and its lease stays
+    $script:D = New-Dir 'launcher'
+    & $thor hold gpu -By hz -NoQuiet -Dir $D *> $null
+    $rc = T run gpu -By hz -Exe cmd.exe -ArgList '/c exit 0' -TimeoutMin 0.3
+    $l = (Status).leases.gpu
+    Check "a launcher's own next run is covered" ($rc -eq 0 -and $out -match 'covered')
+    Check 'and the launcher keeps its lease' ($l.state -eq 'live' -and [int]$l.lease.pid -eq $PID)
+    [void](T release gpu -By hz)
+
     # The HUD feed's own command line names its services (COMFY=8188,IMAGEGEN=8391): it is not image generation
     $script:D = New-Dir 'hud'
     $fx = Join-Path $base 'hud-fixture.json'
