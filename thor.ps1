@@ -1030,6 +1030,10 @@ function Dispatch-Pass {
                 if (-not $j -or [string]$j.state -ne 'queued' -or [string]$j.lease -ne $nm -or [string]$j.runBy -ne [string]$first.by) { return $null }
                 if (-not (Gate-On) -or -not (Gate-Hold $nm $first)) { break }
             }
+            # A job file written by an older copy has none of what the submitter's session said about the box: the dispatcher's own goes with it.
+            foreach ($kv in @(@('mutex', $script:MutexBase), @('gameExe', $GameExe), @('scratchDir', [string]$ScratchDir), @('agentMarkers', [string]$env:THOR_AGENT_MARKERS))) {
+                if ($null -eq $j.PSObject.Properties[$kv[0]]) { $j | Add-Member -NotePropertyName $kv[0] -NotePropertyValue $kv[1] -Force }
+            }
             $j.state = 'starting'; $j.started = Now-Iso; Write-Job $j
             Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($nm -eq $CardLease) { " cap ~$(Iso (Job-CapAt $j))" })$(if ($j.note) { " for: $($j.note)" })"
             return $j
