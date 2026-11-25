@@ -13,7 +13,8 @@ function Cop-Procs {
         Where-Object { $_.CommandLine -match 'thor\.ps1"?\s+(cop|watch)(\s|$)' })
 }
 function Cop-Held {
-    $m = New-Object Threading.Mutex($false, 'Global\ThorTraffic_cop')
+    $mb = if ($env:THOR_MUTEX -match '^[A-Za-z0-9_.-]{1,40}$') { $env:THOR_MUTEX } else { 'ThorTraffic' }   # thor.ps1's mutex base
+    $m = New-Object Threading.Mutex($false, "Global\$($mb)_cop")
     try { $free = $m.WaitOne(0) } catch { $free = $true }   # abandoned (its cop was killed) = free, and ours after the exception
     if ($free) { try { $m.ReleaseMutex() } catch {} }
     $m.Dispose(); return -not $free

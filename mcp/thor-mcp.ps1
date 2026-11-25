@@ -20,7 +20,7 @@ $Tools = [ordered]@{
         desc = 'Give a lease back the moment the step that needed it ends.' }
     thor_unqueue = @{ verb = 'unqueue'; schema = (Schema ([ordered]@{ lease = $S; by = $S }) @('lease', 'by'))
         desc = 'Leave a queue.' }
-    thor_submit  = @{ verb = 'submit'; fixed = @('-Json'); schema = (Schema ([ordered]@{ lease = $S; by = $S; exe = $S; argList = $S; workDir = $S; for = $S; estMin = $N; quiet = $B; noQuiet = $B; timeoutMin = $N; notBefore = $S; priority = $N; preemptible = $B }) @('by', 'exe'))
+    thor_submit  = @{ verb = 'submit'; fixed = @('-Json'); schema = (Schema ([ordered]@{ lease = $S; by = $S; exe = $S; argList = $S; workDir = $S; for = $S; estMin = $N; quiet = $B; noQuiet = $B; timeoutMin = $N; notBefore = $S; priority = $N; preemptible = $B; noGate = $B }) @('by', 'exe'))
         desc = 'Queue a launch command as a job; Thor starts it when the lease is free. Returns the job as JSON; read it back with thor_job.' }
     thor_job     = @{ verb = 'job'; fixed = @('-Json'); schema = (Schema ([ordered]@{ jobId = $S; by = $S; cancel = $B }))
         desc = 'A job by id (state, exit code, output files), or the jobs of one -By. cancel stops it and its whole process tree.' }

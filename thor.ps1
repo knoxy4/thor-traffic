@@ -72,6 +72,24 @@
 # queue: the cop stops it (state preempted, job-preempt in lease.log, a note) and queues it again under the same name, first among
 # its priority. A job that isn't -Preemptible is never stopped for priority.
 #
+# Project gate. The leases are separate locks, but on one Unreal project they share files. Every editor, commandlet and -game
+# run loads the project's editor module dll, so a link can't replace it (LNK1104). A -game run holds the .uasset files it loaded
+# open, so a commandlet's save fails, and a run that starts mid-import reads a half-written asset. So the dispatcher holds a
+# queued job while a clash on the SAME project runs (the profile's gate; the preset's classes):
+#   build  (Build.bat / UBT / UAT)             waits for any editor, commandlet or -game run of that project, or another build
+#   write  (UnrealEditor*.exe -run=)           waits for a -game run or a build of it
+#   game   (UnrealEditor*.exe -game/-server)   waits for a commandlet or a build of it
+#   editor (UnrealEditor.exe, neither)         waits for a build of it
+# The job's class and project come from its -Exe and -ArgList (an -EncodedCommand or -ArgListB64 is decoded; a .ps1, .bat, .cmd
+# or .py given as -Exe or named by an absolute path in the arguments is read, its first 200 lines, when they alone don't tell),
+# the project from a .uproject path or a "<Name>Editor Win64" target. What runs comes from the box and from jobs already starting
+# or running, so two jobs dispatched a second apart can't both go. A job that shows Unreal but names no project counts as every
+# project, held and holding: name its .uproject, even in a comment in its script, to narrow it. A .py that only names the editor
+# is usually asking whether it is up, so it needs a build, a -game or a -run= to count. Packaged runs load neither file and never
+# clash, and a job with no sign of Unreal is never held. A held job keeps its queue place but stands aside (see Standing aside),
+# records why in its gate field (job shows it) and says so once per change in lease.log: gate <lease> <who> job <id> waits: ...
+# submit -NoGate skips it. Plain take / run / hold are not gated. A profile without "gate" has no gate.
+#
 # Quiet GPU. For anything timed: no other holder's gpu lease, under -MaxVramGB of video memory in use, the GPU under
 # -MaxUtil % busy (median of samples), no local LLM / image-generation python, no -game / packaged / commandlet run, no
 # editor (-AllowEditor ignores it) and no UBT / UAT / shader-compile / cargo work (-AllowBuild ignores it). quiet -Wait,
@@ -190,7 +208,8 @@ param(
     [string]$ProfilePath = '',
     [string]$NotBefore = '',
     [int]$Priority = 0,
-    [switch]$Preemptible
+    [switch]$Preemptible,
+    [switch]$NoGate
 )
 $ErrorActionPreference = 'Stop'
 $script:BoundKeys = @($PSBoundParameters.Keys)
@@ -200,6 +219,10 @@ if ($env:THOR_UTF8) { try { [Console]::OutputEncoding = New-Object Text.UTF8Enco
 # which resolves against the process directory, not the shell's. No trailing slash: "C:\x\" ends a quoted argument early.
 $Dir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dir)
 if ($Dir.Length -gt 3) { $Dir = $Dir.TrimEnd('\', '/') }
+# The named mutexes: Global\<base>_lease, _cop and _board. $env:THOR_MUTEX renames the base, so another tool on the same state
+# folder (an older copy, say) can share the one lock. Every process on one folder must use the same base; a job carries it.
+function Mutex-Base([string]$B) { if ($B -match '^[A-Za-z0-9_.-]{1,40}$') { return $B }; return 'ThorTraffic' }
+$script:MutexBase = Mutex-Base ([string]$env:THOR_MUTEX)
 function Quote-Arg([string]$S) { return '"' + ($S -replace '(\\+)$', '$1$1') + '"' }
 # ---- the profile: leases and process kinds as data (this one is the Unreal preset; a file can replace it) -----------------
 # The code below asks this table what a lease is and what a process is.
@@ -214,6 +237,12 @@ function Quote-Arg([string]$S) { return '"' + ($S -replace '(\\+)$', '$1$1') + '
 # hooks (a file only) = @( @{ on = regex on a lease.log event; exe; args } ): the cop starts exe for each matching line (see Sinks).
 #   idleProbe = @{ url; idle; timeoutMs } for a daemon that stays up with nothing loaded: when the url answers within timeoutMs
 #   (1000) and the answer matches the regex idle, a process of that kind is neither noise nor the lease in use. No answer = busy.
+# gate (optional; header: Project gate) = what a queued job is, and what it must not run beside on the same project.
+#   classes = @( @{ class; match; notInPy } ), first match wins on the job's command text: class is a word, match a regex,
+#   notInPy = a match found only in a .py script doesn't count. project = regexes whose group 1 names the project.
+#   clash = @{ <class> = @(classes it waits for) }. running = @{ <process kind> = <class> }: what runs on the box (a busyCpp kind
+#   counts only as a C++ build). leaseClass = @{ <lease> = <class> } for a job that names a project but shows no class.
+#   noScan = a regex on -Exe: the scripts named in its arguments are not read (Blender's .py says nothing about Unreal).
 $Traits = @{
     name = 'unreal'
     leases = [ordered]@{
@@ -242,6 +271,19 @@ $Traits = @{
         commandlet = @{ noise = 'commandlet: pid {pid} {cmd}'; neverStop = $true }
         editor     = @{ noise = 'editor open: pid {pid} {cmd} (-AllowEditor to ignore)'; allow = 'AllowEditor'; neverStop = $true }
         build      = @{ noise = 'build work: {name} pid {pid} (-AllowBuild to ignore)'; allow = 'AllowBuild' }
+    }
+    gate = @{
+        classes = @(
+            @{ class = 'build'; match = '(?i)Build\.bat|UnrealBuildTool|RunUBT\.bat|RunUAT\.bat|AutomationTool' }
+            @{ class = 'write'; match = '(?i)^(?=[\s\S]*UnrealEditor)(?=[\s\S]*(^|[\s"])-run=)' }
+            @{ class = 'game'; match = '(?i)^(?=[\s\S]*UnrealEditor)(?=[\s\S]*(^|[\s"])-(game|server)(?=[\s"]|$))' }
+            @{ class = 'editor'; match = '(?i)UnrealEditor'; notInPy = $true }
+        )
+        project = @('(?i)([A-Za-z0-9_\-]+)\.uproject', '(?i)\b([A-Za-z0-9_]+)Editor\s+Win64\b')
+        clash = @{ build = @('build', 'write', 'game', 'editor'); write = @('build', 'game'); game = @('build', 'write'); editor = @('build') }
+        running = @{ game = 'game'; commandlet = 'write'; editor = 'editor'; build = 'build' }
+        leaseClass = @{ build = 'build' }
+        noScan = '(?i)blender'
     }
 }
 function To-Hash($o) {
@@ -285,6 +327,29 @@ function Read-Profile([string]$Path) {
             if ($ip -isnot [Collections.IDictionary] -or [string]$ip.url -notmatch '^https?://' -or -not [string]$ip.idle) { & $bad "kind '$k': idleProbe needs a url (http or https) and idle (a regex on the answer)" }
             try { [void][regex]::new([string]$ip.idle) } catch { & $bad "kind '$k': idleProbe.idle is not a regex" }
         }
+    }
+    $g = $t.gate
+    if ($null -ne $g) {
+        $rx = { param($v, $what) try { [void][regex]::new([string]$v) } catch { & $bad "gate: $what is not a regex" } }
+        if ($g -isnot [Collections.IDictionary]) { & $bad '"gate" must be an object' }
+        if ($null -eq $g.classes -or $g.classes -is [Collections.IDictionary] -or -not @($g.classes).Count) { & $bad 'gate needs "classes", an array of { class, match }' }
+        $cls = @()
+        foreach ($c in @($g.classes)) {
+            if ($c -isnot [Collections.IDictionary] -or [string]$c.class -cnotmatch '^[a-z][a-z0-9_-]{0,15}$' -or -not [string]$c.match) { & $bad 'gate: each class needs class (a lower-case word) and match (a regex)' }
+            & $rx $c.match "class '$($c.class)' match"; $cls += [string]$c.class
+        }
+        if ($null -eq $g.project -or $g.project -is [Collections.IDictionary] -or -not @($g.project).Count) { & $bad 'gate needs "project", an array of regexes whose group 1 names the project' }
+        foreach ($p in @($g.project)) { & $rx $p 'a project pattern'; if (([regex]::new([string]$p)).GetGroupNumbers() -notcontains 1) { & $bad "gate: project pattern '$p' has no group 1" } }
+        foreach ($f in @('clash', 'running', 'leaseClass')) {
+            if ($null -eq $g[$f]) { $g[$f] = [ordered]@{} }
+            if ($g[$f] -isnot [Collections.IDictionary]) { & $bad "gate: $f must be an object" }
+        }
+        foreach ($k in @($g.clash.Keys)) {
+            if ($cls -notcontains $k) { & $bad "gate: clash names class '$k', which no class defines" }
+            foreach ($v in @($g.clash[$k])) { if ($cls -notcontains [string]$v) { & $bad "gate: clash.$k names class '$v', which no class defines" } }
+        }
+        foreach ($f in @('running', 'leaseClass')) { foreach ($k in @($g[$f].Keys)) { if ($cls -notcontains [string]$g[$f][$k]) { & $bad "gate: $f.$k is '$($g[$f][$k])', which no class defines" } } }
+        if ($g.noScan) { & $rx $g.noScan 'noScan' }
     }
     foreach ($w in @('webhook', 'webhookUrl', 'url')) { if ($t.Contains($w)) { & $bad "a webhook url lives in `$env:THOR_WEBHOOK_URL only, never in a file (it often carries a token)" } }
     if ($null -eq $t.hooks) { $t.hooks = @() }
@@ -382,7 +447,7 @@ function Log-Line([string]$Line) { [IO.File]::AppendAllText($LogFile, "$(Now-Iso
 $script:LockWaitSec = 45   # under a typical tool call's limit; Wait-Lease raises it, because a waiter has nowhere better to be
 function With-Lock([scriptblock]$Body) {
     # Held for a read-modify-write only; waits never sit inside it, and neither do slow reads.
-    $m = New-Object Threading.Mutex($false, 'Global\ThorTraffic_lease')
+    $m = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_lease")
     $got = $false
     try {
         try { $got = $m.WaitOne($script:LockWaitSec * 1000) }
@@ -506,7 +571,8 @@ function Queue-First($Q) {
     $quietAhead = @(); $now = [DateTime]::UtcNow
     foreach ($e in @($Q)) {
         if ($e.notBefore -and (To-Utc $e.notBefore) -gt $now) { continue }
-        if ($e.parked) { $quietAhead += [string]$e.quietKey; continue }
+        # Held by the project gate: it stands aside, but says nothing about the GPU for those behind it.
+        if ($e.parked) { if ($e.parked -eq 'quiet') { $quietAhead += [string]$e.quietKey }; continue }
         if ($e.needQuiet -and $quietAhead -contains [string]$e.quietKey) { continue }
         return $e
     }
@@ -517,6 +583,7 @@ function Waiting-Count($Q) {
     $now = [DateTime]::UtcNow
     return @(@($Q) | Where-Object { $_ -and -not ($_.notBefore -and (To-Utc $_.notBefore) -gt $now) }).Count
 }
+function Park-Text($E) { switch ([string]$E.parked) { 'quiet' { 'waiting for a quiet GPU' } 'gate' { 'waiting on the project gate' } default { '' } } }
 function Quiet-Key { return "$([bool]$AllowEditor)|$([bool]$AllowBuild)|$MaxVramGB|$MaxUtil" }
 function Cap-Span([double]$Est) { return 2 * $Est + $CapPadMin }
 function Cap-At($L) {
@@ -799,11 +866,11 @@ function Do-Submit {
         $id = New-JobId $runBy $now
         $job = [pscustomobject][ordered]@{
             id = $id; by = $By; runBy = $runBy; lease = $Lease; note = $For; est = $est
-            exe = $exePath; args = $ArgList; cwd = $cwd; noQuiet = [bool]$NoQuiet; timeoutMin = $tmo
+            exe = $exePath; args = $ArgList; cwd = $cwd; noQuiet = [bool]$NoQuiet; noGate = [bool]$NoGate; timeoutMin = $tmo
             allowEditor = [bool]$AllowEditor; allowBuild = [bool]$AllowBuild; maxVramGB = $MaxVramGB; maxUtil = $MaxUtil; settleSec = $SettleSec
             prio = $Priority; preemptible = [bool]$Preemptible; notBefore = $(if ($nb) { Iso $nb } else { $null })
             # The runner starts through WMI with a fresh environment: what the submitter's session said about the box goes with the job.
-            gameExe = $GameExe; scratchDir = [string]$ScratchDir; agentMarkers = [string]$env:THOR_AGENT_MARKERS
+            gameExe = $GameExe; scratchDir = [string]$ScratchDir; agentMarkers = [string]$env:THOR_AGENT_MARKERS; mutex = $script:MutexBase
             state = 'queued'; why = ''; submitted = Iso $now; started = $null; took = $null; ended = $null; exit = $null; runPid = $null; childPid = $null
             log = (Join-Path $JobDir "$id.log"); out = (Join-Path $JobDir "$id.out.log"); err = (Join-Path $JobDir "$id.err.log")
         }
@@ -845,6 +912,98 @@ function Do-Submit {
     Say "follow it: thor.ps1 job -JobId $($res.id)   (-Json for scripts, -Cancel to stop it; output in $($j.out))"
     exit 0
 }
+# ---- project gate (header: Project gate; the profile's gate says what is what) ------------------------------------------
+function Gate-On { return [bool]$Traits.gate }
+function Gate-Kind([string]$T, [switch]$Py) {
+    foreach ($c in @($Traits.gate.classes)) {
+        if ($T -match [string]$c.match) { if ($Py -and $c.notInPy) { return '' }; return [string]$c.class }
+    }
+    return ''
+}
+function Gate-Project([string]$T) {
+    if (-not $T) { return '' }
+    foreach ($p in @($Traits.gate.project)) { $m = [regex]::Match($T, [string]$p); if ($m.Success -and $m.Groups[1].Value) { return $m.Groups[1].Value.ToUpperInvariant() } }
+    return ''
+}
+function Gate-Class([string]$GExe, [string]$GArgs, [string]$GLease) {
+    $t = "$GExe $GArgs"
+    $m = [regex]::Match($GArgs, '(?i)-ArgListB64\s+"?([A-Za-z0-9+/=]+)')
+    if ($m.Success) { try { $t += ' ' + [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($m.Groups[1].Value)) } catch {} }
+    $m = [regex]::Match($GArgs, '(?i)-(EncodedCommand|enc|ec)\s+"?([A-Za-z0-9+/=]+)')
+    if ($m.Success) { try { $t += ' ' + [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($m.Groups[2].Value)) } catch {} }
+    $cls = Gate-Kind $t
+    $proj = Gate-Project $t
+    if (-not $cls -or -not $proj) {
+        # A wrapper (-Exe x.cmd, -File x.ps1, cmd /c x.bat, python x.py) hides what it runs: read the script it is, or names.
+        $wrappers = @()
+        if ($GExe -match '(?i)\.(ps1|bat|cmd|py)$') { $wrappers += $GExe }
+        $m = [regex]::Match($GArgs, '(?i)"?([A-Za-z]:\\[^"]+?\.(ps1|bat|cmd|py))"?(\s|$)')
+        if ($m.Success -and -not ($Traits.gate.noScan -and $GExe -match [string]$Traits.gate.noScan)) { $wrappers += $m.Groups[1].Value }
+        foreach ($wp in $wrappers) {
+            if (-not (Test-Path -LiteralPath $wp -PathType Leaf)) { continue }
+            try {
+                $body = (Get-Content -LiteralPath $wp -TotalCount 200 -ErrorAction Stop) -join ' '
+                if (-not $cls) { $cls = Gate-Kind $body -Py:($wp -match '(?i)\.py$') }
+                if (-not $proj) { $proj = Gate-Project $body }
+            } catch {}
+        }
+    }
+    # A class but no project: it could be any of them. The lease alone isn't that sign (Blender runs on the build lease).
+    $unnamed = [bool]$cls -and -not $proj
+    if (-not $cls -and $Traits.gate.leaseClass -and $Traits.gate.leaseClass[$GLease]) { $cls = [string]$Traits.gate.leaseClass[$GLease] }
+    return @{ cls = $cls; proj = $proj; unnamed = $unnamed }
+}
+function Gate-Running {
+    # What runs now, by project: the box's processes of a gated kind, plus jobs already starting or running.
+    $out = New-Object Collections.Generic.List[object]
+    foreach ($p in $(if ($null -ne $script:GateProcs) { $script:GateProcs } else { Get-Procs })) {
+        $c = [string]$Traits.gate.running[[string]$p.kind]
+        if (-not $c -or ($BuildKinds -contains [string]$p.kind -and -not $p.cpp)) { continue }
+        $pj = Gate-Project ([string]$p.full)
+        if ($pj) { $out.Add([pscustomobject]@{ cls = $c; proj = $pj; unnamed = $false; what = "$($p.name) pid $($p.pid)" }) }
+    }
+    foreach ($oj in (Recent-Jobs 13)) {
+        if ([string]$oj.state -notin @('starting', 'running')) { continue }
+        if ([string]$oj.state -eq 'starting' -and $oj.waiting) { continue }   # still waiting for quiet: it has started nothing
+        $g = Gate-Class ([string]$oj.exe) ([string]$oj.args) ([string]$oj.lease)
+        if ($g.cls -and ($g.proj -or $g.unnamed)) { $out.Add([pscustomobject]@{ cls = $g.cls; proj = $g.proj; unnamed = $g.unnamed; what = "job $($oj.runBy)" }) }
+    }
+    return , $out
+}
+function Gate-Reason($J) {
+    # Why a queued job must wait, or '' when it may go.
+    if (-not (Gate-On) -or $J.noGate) { return '' }
+    $g = Gate-Class ([string]$J.exe) ([string]$J.args) ([string]$J.lease)
+    if (-not $g.cls -or -not ($g.proj -or $g.unnamed)) { return '' }
+    $clash = @($Traits.gate.clash[$g.cls])
+    if (-not $clash.Count) { return '' }
+    if ($null -eq $script:GateRun) { $script:GateRun = Gate-Running }
+    $hit = @($script:GateRun | Where-Object { ($g.unnamed -or $_.unnamed -or $_.proj -eq $g.proj) -and $clash -contains $_.cls })
+    if (-not $hit.Count) { return '' }
+    $who = @($hit | ForEach-Object { "$($_.cls) ($($_.what))" } | Select-Object -Unique) -join ', '
+    $why = "$(if ($g.unnamed) { 'no project named:' } else { $g.proj }) $($g.cls) clashes with $who"
+    if ($g.unnamed -or @($hit | Where-Object { $_.unnamed }).Count) { $why += '; a job that names no project counts as every project (name its .uproject in the job or its script, or submit -NoGate)' }
+    return $why
+}
+function Gate-Hold([string]$Name, $E) {
+    # Under the lease mutex: true while a same-project clash runs. Parks or unparks the job's queue entry and says why once per change.
+    $j = Read-Job ([string]$E.job)
+    if (-not $j) { return $false }
+    $why = ''
+    try { $why = Gate-Reason $j } catch { $why = '' }
+    if ([string]$j.gate -ne $why) {
+        $j | Add-Member -NotePropertyName gate -NotePropertyValue $why -Force; Write-Job $j
+        if ($why) { Log-Line "gate $Name $($j.runBy) job $($j.id) waits: $why" } else { Log-Line "gate $Name $($j.runBy) job $($j.id) clear" }
+    }
+    $mark = if ($why) { 'gate' } else { '' }
+    if ([string]$E.parked -ne $mark) {
+        $E | Add-Member -NotePropertyName parked -NotePropertyValue $mark -Force
+        $all = @(Read-Queue $Name)
+        foreach ($x in $all) { if ($x.by -eq $E.by) { $x | Add-Member -NotePropertyName parked -NotePropertyValue $mark -Force } }
+        Write-Queue $Name $all
+    }
+    return [bool]$why
+}
 function Job-CapAt($J) { return (To-Utc $J.started).AddMinutes((Cap-Span ([double]$J.est))) }
 function Dispatch-Pass {
     # Starts a lease's first ready waiter when it is a submitted job and nobody holds the lease (free, kept for that job). Safe to
@@ -854,15 +1013,23 @@ function Dispatch-Pass {
     if (-not (Test-Path -LiteralPath $JobDir)) { return @() }
     try { [void](Prune-Jobs) } catch {}
     $begun = @()
+    $script:GateRun = $null; $script:GateProcs = $null
+    # The gate needs the process list, which takes seconds on a busy box, so it is read before the lock (a pass's view is seconds old anyway).
+    if ((Gate-On) -and @($Names | ForEach-Object { Read-Queue $_ } | Where-Object { $_.job }).Count) { try { $script:GateProcs = @(Get-Procs) } catch { $script:GateProcs = @() } }
     foreach ($nm in $Names) {
         $go = With-Lock {
             $cur = Read-Lease $nm
             if ((Lease-State $cur) -eq 'live') { return $null }
             $q = Live-Queue $nm ''
-            $first = Queue-First $q
-            if (-not $first -or -not $first.job) { return $null }
-            $j = Read-Job ([string]$first.job)
-            if (-not $j -or [string]$j.state -ne 'queued' -or [string]$j.lease -ne $nm -or [string]$j.runBy -ne [string]$first.by) { return $null }
+            # A job the gate held gets another look every pass; then the first ready waiter goes, unless the gate holds it too.
+            if (Gate-On) { foreach ($e in @($q | Where-Object { $_.parked -eq 'gate' })) { [void](Gate-Hold $nm $e) } }
+            while ($true) {
+                $first = Queue-First $q
+                if (-not $first -or -not $first.job) { return $null }
+                $j = Read-Job ([string]$first.job)
+                if (-not $j -or [string]$j.state -ne 'queued' -or [string]$j.lease -ne $nm -or [string]$j.runBy -ne [string]$first.by) { return $null }
+                if (-not (Gate-On) -or -not (Gate-Hold $nm $first)) { break }
+            }
             $j.state = 'starting'; $j.started = Now-Iso; Write-Job $j
             Log-Line "dispatch $nm $($j.runBy) job $($j.id)$(if ($nm -eq $CardLease) { " cap ~$(Iso (Job-CapAt $j))" })$(if ($j.note) { " for: $($j.note)" })"
             return $j
@@ -880,6 +1047,7 @@ function Dispatch-Pass {
             $cr = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments $ca -ErrorAction Stop
             if ($cr.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($cr.ReturnValue)" }
             [void](Set-Job $go.id @{ runPid = [int]$cr.ProcessId; runPidStart = Pid-Stamp ([int]$cr.ProcessId) }); $begun += $go
+            $script:GateRun = $null   # a starting job now: the next lease's candidate must see it
         }
         catch {
             [void](Set-Job $go.id @{ state = 'failed'; ended = Now-Iso; why = "the runner did not start: $($_.Exception.Message)" })
@@ -942,7 +1110,7 @@ function Stop-JobTree($Jb) {
 function Job-Line($J) {
     $t = { param($v) if ($v) { Local-Hm $v } else { '--:--' } }
     $ex = if ($null -ne $J.exit) { " exit $($J.exit)" } else { '' }
-    $wt = if ([string]$J.state -eq 'starting' -and $J.waiting) { "  [waits: $(Short ([string]$J.waiting) 70)]" } else { '' }
+    $wt = if ([string]$J.state -eq 'starting' -and $J.waiting) { "  [waits: $(Short ([string]$J.waiting) 70)]" } elseif ([string]$J.state -eq 'queued' -and $J.gate) { "  [gate: $(Short ([string]$J.gate) 70)]" } else { '' }
     return ('{0,-26} {1,-9} {2,-6} sub {3}  start {4}  end {5}{6}  {7}{8}' -f $J.id, $J.state, $J.lease, (& $t $J.submitted), (& $t $J.started), (& $t $J.ended), $ex, (Short ([string]$J.note) 60), $wt)
 }
 # ---- stats ---------------------------------------------------------------------------------------------------------------
@@ -1787,7 +1955,7 @@ function Board-Lines($M) {
         $k = 0
         foreach ($w in $q) {
             $k++; $back = To-Utc $w.nextCheck; $late = $back -lt $now
-            $when = if ($w.parked) { 'stands aside: waiting for a quiet GPU' } elseif ($late) { "LATE: checks back by $(Local-Hm $back), drops at $(Local-Hm $w.until)" } else { "checks back $(Local-Hm $back) ($(In-Min $back))" }
+            $when = if ($w.parked) { "stands aside: $(Park-Text $w)" } elseif ($late) { "LATE: checks back by $(Local-Hm $back), drops at $(Local-Hm $w.until)" } else { "checks back $(Local-Hm $back) ($(In-Min $back))" }
             Row ("    {0}. {1,-6} {2,-34} ~{3,3}m   starts ~{4} ({5})   {6}" -f $k, $w.by, $(if ($w.note) { "'$(Short $w.note 32)'" } else { '' }), [int][double]$w.est, (Local-Hm $w.start), (In-Min (To-Utc $w.start)), $when) $(if ($late) { 'Red' } else { 'Yellow' })
         }
     }
@@ -1923,7 +2091,7 @@ function Ansi-Rows($M, [int]$Width, [int]$Height) {
         $qi = 0
         foreach ($qe in $q) {
             $qi++; $back = To-Utc $qe.nextCheck; $late = $back -lt $now; $start = To-Utc $qe.start
-            $backSeg = if ($qe.parked) { Seg 'aside: waiting for a quiet GPU' $K.cyan } elseif ($qe.job) { Seg 'AUTO: starts itself' $K.green } elseif ($late) { Seg "LATE, drops $(Local-Hm $qe.until)" $K.red } else { Seg (Local-Hm $back) $K.txt }
+            $backSeg = if ($qe.parked) { Seg "aside: $(Park-Text $qe)" $K.cyan } elseif ($qe.job) { Seg 'AUTO: starts itself' $K.green } elseif ($late) { Seg "LATE, drops $(Local-Hm $qe.until)" $K.red } else { Seg (Local-Hm $back) $K.txt }
             Add @((Seg ('              {0} ' -f $qi) $K.dim), (Seg "$($Ch.arr) " $K.amber), (Seg ('{0,-6}' -f $qe.by) ($K.amber)), (Seg ('  {0,-36} ' -f (Short ([string]$qe.note) 36)) $K.txt),
                 (Seg ('{0,5}' -f ('~' + [int][double]$qe.est + 'm')) $K.dim), (Seg '   starts ' $K.dim), (Seg (Local-Hm $start) $K.txt), (Seg (' ({0})' -f (In-Min $start)) $K.dim), (Seg $(if ($qe.job) { '   ' } else { '   back ' }) $K.dim), $backSeg)
         }
@@ -2255,7 +2423,7 @@ switch ($Verb) {
                 $k++
                 $lab = if ($k -eq 1) { 'queue:' } else { '' }
                 $line = '          {0,-6} {1}. {2}{3} ~{4} min, expected start {5}, checks back by {6}' -f $lab, $k, $w.by, $(if ($w.note) { " '$($w.note)'" } else { '' }), $w.est, (Local-Hm $w.start), (Local-Hm $w.nextCheck)
-                if ($w.parked) { $line += "; stands aside, waiting for a quiet GPU, so the lease isn't kept for it" }
+                if ($w.parked) { $line += "; stands aside, $(Park-Text $w), so the lease isn't kept for it" }
                 Write-Host $line -ForegroundColor Yellow
             }
         }
@@ -2332,7 +2500,7 @@ switch ($Verb) {
         exit 0
     }
     'cop' {
-        $script:CopMutex = New-Object Threading.Mutex($false, 'Global\ThorTraffic_cop')
+        $script:CopMutex = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_cop")
         if (-not (Take-Mutex $script:CopMutex)) {
             if (-not $CopWait) { Fail 'another cop is already running (a watch window or a cop task)' 2 }
             # The logon task's cop: wait for a watch window's cop to close, then take over.
@@ -2360,7 +2528,7 @@ switch ($Verb) {
         if ($Frame) {
             # One coloured frame on stdout, then exit: for docs, screenshots and CI.
             try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
-            $probe = New-Object Threading.Mutex($false, 'Global\ThorTraffic_cop')
+            $probe = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_cop")
             if ($Fixture) { $script:CopNote = 'on in another window or task' }
             elseif (Take-Mutex $probe) { $probe.ReleaseMutex(); $script:CopNote = 'off: no watch window or cop task is running' } else { $script:CopNote = 'on in another window or task' }
             $probe.Dispose()
@@ -2369,18 +2537,18 @@ switch ($Verb) {
             [Console]::Out.Write((($fr -join "`n") + "$($script:R0)`n")); exit 0
         }
         if (-not $NoCop -and -not $Once) {
-            $script:CopMutex = New-Object Threading.Mutex($false, 'Global\ThorTraffic_cop')
+            $script:CopMutex = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_cop")
             if (Take-Mutex $script:CopMutex) { $script:CopOn = $true } else { $script:CopNote = 'on in another window or task' }
         }
         if ($Once) {
             # Say whether a cop is running elsewhere: try its mutex, and let go at once if it was free.
-            $probe = New-Object Threading.Mutex($false, 'Global\ThorTraffic_cop')
+            $probe = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_cop")
             if (Take-Mutex $probe) { $probe.ReleaseMutex(); $script:CopNote = 'off: no watch window or cop task is running' } else { $script:CopNote = 'on in another window or task' }
             $probe.Dispose()
             Show-Board (Board-Lines (Board-Model)); exit 0
         }
         # One board at a time: a second launch (the desktop shortcut clicked again) says so and closes.
-        $script:BoardMutex = New-Object Threading.Mutex($false, 'Global\ThorTraffic_board')
+        $script:BoardMutex = New-Object Threading.Mutex($false, "Global\$($script:MutexBase)_board")
         if (-not (Take-Mutex $script:BoardMutex)) { Write-Host 'THOR traffic is already open in another window.' -ForegroundColor Yellow; Start-Sleep -Seconds 2; exit 0 }
         try { $host.UI.RawUI.WindowTitle = 'THOR traffic' } catch {}
         $vt = $false; try { $vt = [bool]$host.UI.SupportsVirtualTerminal } catch {}
@@ -2447,6 +2615,7 @@ switch ($Verb) {
             if ($jb.gameExe -and [string]$jb.gameExe -ne $GameExe) { foreach ($r in @($Traits.rules)) { if ([string]$r.name -eq $GameExe) { $r.name = [string]$jb.gameExe } }; $GameExe = [string]$jb.gameExe }
             if ($jb.scratchDir) { $ScratchDir = [string]$jb.scratchDir }
             if ($jb.agentMarkers) { $env:THOR_AGENT_MARKERS = [string]$jb.agentMarkers }
+            if ($jb.mutex) { $script:MutexBase = Mutex-Base ([string]$jb.mutex) }
             try { Start-Transcript -LiteralPath ([string]$jb.log) -Append | Out-Null } catch {}
         }
         function Job-End([string]$State, $Code, [string]$Why) {
