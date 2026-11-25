@@ -52,8 +52,9 @@
 # take the lease after -SettleSec, so its estimate starts with the work. While the GPU is noisy the waiter is parked: it
 # keeps its place, but the lease isn't kept for it and whoever can use it now takes it (a plain take, a -NoQuiet job). Once
 # quiet it unparks, reclaims its place and the lease is kept for it through the settle. A queued job behind one parked for
-# quiet with the same quiet switches waits unstarted, because it would only wait too. A holder that calls run or hold lets
-# its own lease go while the GPU is noisy. A waiter parked -ParkWarnMin (15) says so in lease.log as park-long, then hourly,
+# quiet with the same quiet switches waits unstarted, because it would only wait too. A holder that calls run or hold under
+# its own name keeps its lease while it waits (letting go would leave its running child uncovered), and its own tree isn't
+# noise to it. A second process under a held name, not under the holder, is refused: one name is one holder. A waiter parked -ParkWarnMin (15) says so in lease.log as park-long, then hourly,
 # and the board toasts it.
 #
 # Dispatcher. submit puts a launch command in the queue as a job (jobs\<id>.json) under its own name <who>.j<n>. It needs
@@ -96,7 +97,8 @@
 # run, hold and dispatched jobs need it to hold for -SettleSec in a row. Windows doesn't report VRAM per process, so the
 # card total gates. run waits for it on any lease unless -NoQuiet, and hold on gpu only. A job on the gpu lease waits only if
 # it asks, with -Quiet or one of quiet's switches, because most gpu work isn't timed. A job on the editor or build lease waits
-# unless -NoQuiet: with an editor open, that is what keeps a build job from failing at the link.
+# unless -NoQuiet: with an editor open, that is what keeps a build job from failing at the link. Off the gpu lease the wait
+# counts only the other leases' work (editor, commandlet, build), not the card's load, image generation or a local LLM.
 #
 # The cop (inside watch unless -NoCop, or alone as `cop`; install-cop.ps1 runs it at logon; one cop at a time):
 #   - stops agent -game and packaged runs that the gpu lease doesn't cover, once they are -CopGraceSec old (45 s). Never
@@ -671,9 +673,20 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid, [bool]$Ready = $true, 
         $mine = $holder -eq $By
         # Nested: the caller runs under the holder's process, so the work it asks for is already the holder's. It is covered
         # as it stands: nothing is written, nothing queued, and no wait for quiet (the parent's lease is the GPU being busy).
-        if ($holder -and -not $mine -and (Under-Lease $cur)) {
+        # Under its own name too: a launcher holding gpu starts a run of its own that asks again with its own pid.
+        $otherPid = $TiePid -and $cur.pid -and [int]$cur.pid -ne $TiePid
+        if ($holder -and (-not $mine -or $otherPid) -and (Under-Lease $cur)) {
             Log-Line "nested $Name $By (under $holder's lease, pid $($cur.pid))"
             return @{ ok = $true; nested = $true; cur = $cur }
+        }
+        # One name, two processes: a second run or hold under the same -By, not under the first, would take over its pid tie
+        # and both would run at once, the first one uncovered (the cop then stops it). A name is one holder.
+        if ($mine -and $otherPid) {
+            return @{ ok = $false; clash = $true; cur = $cur; msg = "$Name is held by $By already, tied to pid $($cur.pid), another process: give this one its own name (-By $By.2) or run it under that process" }
+        }
+        $oldQ = $q | Where-Object { $_.by -eq $By } | Select-Object -First 1
+        if ($oldQ -and $oldQ.pid -and $TiePid -and [int]$oldQ.pid -ne $TiePid -and (Pid-Is ([int]$oldQ.pid) ([string]$oldQ.pidStart))) {
+            return @{ ok = $false; clash = $true; cur = $cur; msg = "$By is already waiting for $Name from pid $($oldQ.pid), another process: give this one its own name (-By $By.2)" }
         }
         $free = -not $holder -and (-not $first -or $first.by -eq $By)
         if ($mine -and -not $Ready) { return @{ ok = $false; turn = $true; mine = $true; cur = $cur } }
@@ -892,7 +905,7 @@ function Do-Submit {
     try {
         $like = @(Job-Stats 30 | Where-Object { $_.key -eq (Job-Kind $j) }) | Select-Object -First 1
         if ($like -and $like.n -ge 3 -and $like.actual -ge 1.25 * $est -and ($like.actual - $est) -ge 2) {
-            $hint = "the last $($like.n) jobs like this ran a median of $($like.actual) min and you said $est. Your estimate is everyone's wait and sets its cap: cancel it and submit again with a true -EstMin, or renew -EstMin once it runs"
+            $hint = "the last $($like.n) jobs like this ran a median of $($like.actual) min and you said $est. Your estimate is everyone's wait and sets its cap: once it runs, renew $Lease -By $($res.runBy) -EstMin <true minutes> (that keeps its place; a cancel and resubmit loses it)"
         }
     } catch {}
     if ($Json) { if ($hint) { $j | Add-Member -NotePropertyName estimateHint -NotePropertyValue $hint -Force }; $j | ConvertTo-Json -Depth 4; exit 0 }
@@ -1246,18 +1259,25 @@ function Get-Leases {
     foreach ($n in $Names) { $l = Read-Lease $n; $h[$n] = [pscustomobject]@{ lease = $l; state = (Lease-State $l) } }
     return $h
 }
-function Quiet-Reasons($Gpu, $Procs, $Leases, [int[]]$SkipPids = @()) {
+function Quiet-Reasons($Gpu, $Procs, $Leases, [int[]]$SkipPids = @(), [string]$Lease = '') {
+    # With -Lease naming a lease other than the card, only the work of the other leases counts (an open editor, a build, a
+    # commandlet): a build job waits for the editor, not for image generation, a local LLM or the card's load.
     $r = New-Object Collections.Generic.List[string]
+    $off = $Lease -and $Lease -ne $CardLease
+    $offKinds = @(); if ($off) { $offKinds = @($Names | Where-Object { $_ -ne $CardLease } | ForEach-Object { @($Traits.leases[$_].busy) + @($Traits.leases[$_].busyCpp) + @($Traits.leases[$_].covers) } | Where-Object { $_ } | Select-Object -Unique) }
     $g = $Leases[$CardLease]
-    if ($g.state -eq 'live' -and $g.lease.by -ne $By) { $r.Add("gpu lease: $(Describe-Lease $g.lease)") }
-    if (-not $Gpu) { $r.Add('nvidia-smi gave no reading') }
-    else {
-        if ($Gpu.usedMB -gt $MaxVramGB * 1024) { $r.Add(('{0:N1} GB video memory in use (gate {1} GB)' -f ($Gpu.usedMB / 1024), $MaxVramGB)) }
-        if ($Gpu.util -gt $MaxUtil) { $r.Add("GPU $($Gpu.util) % busy (gate $MaxUtil %)") }
+    if (-not $off -and $g.state -eq 'live' -and $g.lease.by -ne $By) { $r.Add("gpu lease: $(Describe-Lease $g.lease)") }
+    if (-not $off) {
+        if (-not $Gpu) { $r.Add('nvidia-smi gave no reading') }
+        else {
+            if ($Gpu.usedMB -gt $MaxVramGB * 1024) { $r.Add(('{0:N1} GB video memory in use (gate {1} GB)' -f ($Gpu.usedMB / 1024), $MaxVramGB)) }
+            if ($Gpu.util -gt $MaxUtil) { $r.Add("GPU $($Gpu.util) % busy (gate $MaxUtil %)") }
+        }
     }
     $allowed = @{ AllowEditor = [bool]$AllowEditor; AllowBuild = [bool]$AllowBuild }
     foreach ($p in $Procs) {
         if ($SkipPids -contains $p.pid -or $p.idle) { continue }
+        if ($off -and [string]$p.kind -notin $offKinds) { continue }
         $kt = $Traits.kinds[[string]$p.kind]
         if (-not $kt -or -not $kt.noise) { continue }
         if ($kt.allow -and $allowed[$kt.allow]) { continue }
@@ -1298,6 +1318,7 @@ function Wait-Lease([string]$Name, [int]$Min, [int]$TiePid, [DateTime]$Deadline,
             $res = Try-Take $Name $Min $TiePid -Ready $ready -NeedQuiet $NeedQuiet -Park $park
             $fails = 0
             if ($res.ok) { return $res }
+            if ($res.clash) { return @{ ok = $false; code = 2; msg = $res.msg; why = $res.msg } }
             $now = [DateTime]::UtcNow
             if (-not $res.turn) {
                 $since = $null; $ready = -not $NeedQuiet
@@ -1306,18 +1327,29 @@ function Wait-Lease([string]$Name, [int]$Min, [int]$TiePid, [DateTime]$Deadline,
                 Start-Sleep -Seconds 5
                 continue
             }
-            $reasons = Quiet-Reasons (Get-Gpu) (Get-Procs) (Get-Leases)
+            $wp = Get-Procs
+            # A holder asking again (a launcher's next step) keeps its lease while it waits: letting it go would leave its own
+            # running child uncovered, and the cop stops that. Its own tree isn't noise to it either.
+            $skip = @()
+            if ($res.mine -and $res.cur) {
+                $roots = @{}; foreach ($q0 in @($res.cur.pid, $res.cur.childPid)) { if ($q0) { $roots[[int]$q0] = 'own' } }
+                $skip = @($wp | Where-Object { Lease-Of $_.pid $roots } | ForEach-Object { $_.pid })
+            }
+            $reasons = Quiet-Reasons (Get-Gpu) $wp (Get-Leases) $skip -Lease $Name
             if ($reasons.Count) {
                 $since = $null; $ready = $false
                 $msg = $reasons -join '; '
-                if ($res.mine) { [void](Do-Release $Name); Say "your $Name lease is let go while the GPU is noisy; you keep a queue place" Yellow }
+                $left = if ($res.mine) { "you keep your $Name lease" } else { "$Name left free" }
                 if ($msg -ne $lastMsg -or ($now - $said).TotalSeconds -ge 60) {
-                    Say "waiting for a quiet GPU, $Name left free: $msg" Yellow; $lastMsg = $msg; $said = $now
+                    Say "waiting for a quiet GPU, $($left): $msg" Yellow; $lastMsg = $msg; $said = $now
                     if ($JobId) { [void](Set-Job $JobId @{ waiting = "no quiet GPU: $msg" } @('starting')) }
                 }
-                if (-not $logged) { $logged = $true; $parkedAt = $now; $warnAt = $now.AddMinutes($ParkWarnMin); Log-Line "park $Name $By waiting for a quiet GPU, $Name left free: $(Short $msg 120)" }
+                if (-not $logged) { $logged = $true; $parkedAt = $now; $warnAt = $now.AddMinutes($ParkWarnMin); Log-Line "park $Name $By waiting for a quiet GPU, $($left): $(Short $msg 120)" }
                 if ($now -ge $warnAt) {
-                    Log-Line "park-long $Name $By $([int][Math]::Ceiling(($now - $parkedAt).TotalMinutes)) min waiting for a quiet GPU: $(Short $msg 100). Not a timing run? $(if ($JobId) { 'Cancel it and submit without -Quiet.' } else { 'Use -NoQuiet.' })"
+                    # The way out differs: a gpu job waits only if asked (-Quiet), an editor or build job waits unless -NoQuiet.
+                    $fix = if ($Name -eq $CardLease) { if ($JobId) { 'Cancel it and submit without -Quiet.' } else { 'Use -NoQuiet.' } }
+                           else { "$(if ($JobId) { 'Cancel it and submit with' } else { 'Use' }) -AllowEditor or -AllowBuild for the work above that is fine, or -NoQuiet." }
+                    Log-Line "park-long $Name $By $([int][Math]::Ceiling(($now - $parkedAt).TotalMinutes)) min waiting for a quiet GPU: $(Short $msg 100). Not a timing run? $fix"
                     $warnAt = $now.AddMinutes(60)
                 }
                 if ($park -ne 'quiet') { $park = 'quiet'; continue }
@@ -2468,6 +2500,7 @@ switch ($Verb) {
                 if (-not $Wait -or [DateTime]::UtcNow -ge $deadline) { throw }
                 Say "look failed, trying again: $($_.Exception.Message)" Yellow; Start-Sleep -Seconds 5; continue
             }
+            if ($res.clash) { Fail $res.msg 2 }
             if ($res.ok -and $res.nested) { Say "$Lease is covered: you run under $($res.cur.by)'s lease (pid $($res.cur.pid)), so its work is yours too. Nothing taken; nothing to release." Green; exit 0 }
             if ($res.ok) {
                 $what = if ($res.renewed) { 'renewed' } else { 'taken' }
@@ -2489,6 +2522,7 @@ switch ($Verb) {
         if ($cur -and $cur.by -ne $By -and (Lease-State $cur) -eq 'live' -and (Under-Lease $cur)) { Say "$Lease is $($cur.by)'s and you run under it (nested): renew it as $($cur.by)" Green; exit 0 }
         if (-not $cur -or $cur.by -ne $By) { Fail "you ($By) don't hold $Lease; take it instead" 2 }
         $res = Try-Take $Lease (Lease-Minutes $Lease) ([int]$(if ($HolderPid) { $HolderPid } elseif ($cur.pid -and (Lease-State $cur) -eq 'live') { $cur.pid } else { 0 }))
+        if ($res.clash) { Fail $res.msg 2 }
         if (-not $res.ok) { Fail "$Lease lapsed and went on: $(Wait-Text $res $Lease)" 2 }
         Say "$Lease renewed: $(Describe-Lease $res.cur)" Green
         if ($res.oldEta -and [Math]::Abs(((To-Utc $res.cur.eta) - $res.oldEta).TotalMinutes) -ge 1) {
@@ -2663,7 +2697,7 @@ switch ($Verb) {
                 if ($cur -and $cur.by -eq $By -and [int]$cur.pid -eq $PID) { $cur.childPid = $p.Id; $cur | Add-Member -NotePropertyName childPidStart -NotePropertyValue $cst -Force; Write-Lease $Lease $cur }
             } | Out-Null
             if ($JobId) { [void](Set-Job $JobId @{ state = 'running'; childPid = $p.Id; childPidStart = $cst; waiting = ''; took = Now-Iso; beat = Now-Iso } @('starting')) }
-            Say "$Lease held; started pid $($p.Id): $Exe $ArgList" Green
+            Say "$(if ($res.nested) { "$Lease covered by $($res.cur.by)'s lease (nested)" } else { "$Lease held" }); started pid $($p.Id): $Exe $ArgList" Green
             # A heartbeat on the job file every 10 min: the lost-runner sweep reads recent files only, and a long job's must stay recent.
             while (-not $p.WaitForExit(600000)) { if ($JobId) { try { [void](Set-Job $JobId @{ beat = Now-Iso } @('running')) } catch {} } }
             $p.WaitForExit()

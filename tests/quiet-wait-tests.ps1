@@ -112,11 +112,11 @@ try {
     Check 'hold -NoQuiet takes it at once' ($rc -eq 0 -and $last -match 'gpu held: g2')
     TL release gpu -By g2 | Out-Null
 
-    # --- a holder that then waits for quiet gives its lease back
+    # --- a holder that then waits for quiet keeps its lease (letting go would leave its own running work uncovered)
     Noisy
     TL take gpu -By z -EstMin 3 | Out-Null
     $z = Bg run gpu -By z -Exe cmd.exe -ArgList $ok -TimeoutMin 2 -SettleSec 3
-    Check 'its own lease is let go while it waits' (Until { -not (L gpu) -and (E gpu z).parked -eq 'quiet' })
+    Check 'its own lease is kept while it waits' ((Until { (LogText) -match 'park gpu z .*you keep your gpu lease' }) -and (L gpu).by -eq 'z')
     Calm
     $z.WaitForExit(30000) | Out-Null
     Check 'and it still runs when quiet' ($z.ExitCode -eq 0 -and -not (L gpu))
@@ -203,12 +203,16 @@ try {
     Calm
     Check 'and runs once quiet' (Until { (Job $oid).state -eq 'done' } 30)
 
-    # --- other leases: jobs still wait for quiet (it's what keeps a build off an open editor); hold never did
+    # --- other leases: jobs still wait for the editor (it's what keeps a build off an open editor), not for GPU load; hold never did
     Noisy
+    Procs '[{"kind":"editor","cpp":false,"pid":5,"name":"UnrealEditor.exe","cmd":"x","full":"UnrealEditor.exe Other.uproject","started":"2026-01-01T00:00:00Z"}]'
     $b2 = Submit build -By ba -Exe cmd.exe -ArgList $ok -For 'build, no switch' -EstMin 1
-    Check 'a build job waits for quiet, standing aside' (Until { (E build $b2.runBy).parked -eq 'quiet' } 15)
+    Check 'a build job waits for an open editor, standing aside' (Until { (E build $b2.runBy).parked -eq 'quiet' } 15)
     Check 'holding no build lease' (-not (L build))
     Tidy $b2.id
+    Procs ''
+    $b1 = Submit build -By bn -Exe cmd.exe -ArgList $ok -For 'build, GPU busy only' -EstMin 1
+    Check 'GPU load alone does not hold a build job' (Until { (Job $b1.id).state -eq 'done' } 20)
     $b3 = Submit build -By bb -Exe cmd.exe -ArgList $ok -For 'build, -NoQuiet' -NoQuiet -EstMin 1
     Check 'with -NoQuiet it goes at once' (Until { (Job $b3.id).state -eq 'done' } 15)
     $rc = TL hold build -By bc -HolderPid $PID
