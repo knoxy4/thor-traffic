@@ -31,7 +31,10 @@
 # Leases. A lease is a file with an expiry (-Minutes; defaults editor 120, build 60, gpu 30; cap 720) that the holder renews
 # or releases, because an agent's tool call is short-lived and can't hold a mutex. A lease tied to a process (-HolderPid,
 # or run / hold / submit) also ends when that process exits, so a killed run frees it; it also outlives its expiry while that
-# process runs, because nothing ends a running command by itself. -EstMin is how long you expect to
+# process runs, because nothing ends a running command by itself. A take, hold, run, renew or release from a process running
+# under a live lease's own process (a build script or launcher the holder started) is nested: it is covered by that lease as it
+# stands, and nothing is taken, queued or released, because waiting on your own parent never ends. Nesting is seen through the
+# pid tie only: a pid-less take can't be nested under. -EstMin is how long you expect to
 # hold it: everyone else's wait times are built from it. Running long: renew -EstMin <minutes still needed> moves the
 # estimate (and the expiry covers it); a plain renew keeps the estimate as it stands and never shortens an expiry.
 # A lease covers the work, not the session: release it the moment that step ends, before you wait on anything else, and
@@ -226,7 +229,7 @@ $Traits = @{
         @{ kind = 'packaged'; name = '{GameExe}' }
         @{ kind = 'llm'; name = '(?i)^(llama-server|ollama_llama_server)' }
         @{ kind = 'llm'; name = '(?i)^ollama\.exe$'; cmd = '(?i)\srunner(\s|$)' }
-        @{ kind = 'imagegen'; name = '(?i)^pythonw?\.exe$'; cmd = '(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen' }
+        @{ kind = 'imagegen'; name = '(?i)^pythonw?\.exe$'; cmd = '(?i)^(?!.*thor_hud\.py).*(comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen)' }
         @{ kind = 'build'; name = '(?i)^(UnrealBuildTool|AutomationTool)\.exe$'; cpp = $true }
         @{ kind = 'build'; name = '(?i)^(ShaderCompileWorker|cargo|rustc)\.exe$' }
         @{ kind = 'build'; name = '(?i)^dotnet\.exe$'; cmd = '(?i)UnrealBuildTool|AutomationTool'; cpp = $true }
@@ -549,7 +552,11 @@ function Check-Back([DateTime]$Start) {
 }
 function Wait-Text($Res, [string]$Name) {
     if ($Res.reservedFor) { $s = "$Name is free but kept for $($Res.reservedFor), first in its queue, until $(Local-Hm $Res.reservedUntil)" }
-    else { $s = "$Name is held by $(Describe-Lease $Res.cur)" }
+    else {
+        $s = "$Name is held by $(Describe-Lease $Res.cur)"
+        # The deadlock to name: a step waiting on its own parent's lease. Thor sees nesting only through a pid tie.
+        if (-not $Res.cur.pid -and (Lane-Root ([string]$Res.cur.by)) -eq (Lane-Root ([string]$By))) { $s += ". If this runs inside $($Res.cur.by)'s own step, that lease has no pid, so Thor can't see the nesting: take it with -HolderPid <launcher pid>, or use hold in the launcher, and nested takes are covered" }
+    }
     $verb = if ($Res.queued) { "You're" } else { "You'd be" }
     $s += ". $verb #$($Res.pos) of $($Res.total) in its queue"
     if ($Res.ahead) { $s += " (behind $($Res.ahead -join ', '))" }
@@ -558,8 +565,34 @@ function Wait-Text($Res, [string]$Name) {
     else { $s += ' Not queued (-NoQueue).' }
     return $s
 }
+function My-Tree {
+    # This process and its live ancestors (start-time checked), read once: a take from under a holder's own tree is nested.
+    if ($null -ne $script:MyTreeSet) { return $script:MyTreeSet }
+    $set = New-Object 'Collections.Generic.HashSet[int]'; [void]$set.Add($PID)
+    try {
+        $all = @{}; foreach ($p in @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate -ErrorAction Stop)) { $all[[int]$p.ProcessId] = $p }
+        $cur = $PID
+        for ($i = 0; $i -lt 32; $i++) {
+            $me = $all[$cur]; if (-not $me) { break }
+            $pp = [int]$me.ParentProcessId; $par = $all[$pp]
+            if (-not $par -or $pp -eq $cur -or ($par.CreationDate -and $me.CreationDate -and $par.CreationDate -gt $me.CreationDate)) { break }
+            [void]$set.Add($pp); $cur = $pp
+        }
+    } catch {}
+    $script:MyTreeSet = $set
+    return $set
+}
+function Under-Lease($L) {
+    # True when this process runs under a live lease's own process (its pid or its child): a build or a launcher the holder
+    # started, asking for the lease its parent already holds. Waiting for it would wait on its own parent forever.
+    if (-not $L) { return $false }
+    $t = My-Tree
+    foreach ($q in @($L.pid, $L.childPid)) { if ($q -and [int]$q -ne 0 -and $t.Contains([int]$q)) { return $true } }
+    return $false
+}
 function Try-Take([string]$Name, [int]$Min, [int]$TiePid, [bool]$Ready = $true, [bool]$NeedQuiet = $false, [string]$Park = '') {
     # -Ready $false does everything but the take: it keeps the caller's queue place and says if the lease is theirs to take (turn).
+    [void](My-Tree)   # outside the lock: a process list is a slow read
     With-Lock {
         $cur = Read-Lease $Name
         $state = Lease-State $cur
@@ -569,6 +602,12 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid, [bool]$Ready = $true, 
         $est = Est-Minutes $Name
         $first = Queue-First $q
         $mine = $holder -eq $By
+        # Nested: the caller runs under the holder's process, so the work it asks for is already the holder's. It is covered
+        # as it stands: nothing is written, nothing queued, and no wait for quiet (the parent's lease is the GPU being busy).
+        if ($holder -and -not $mine -and (Under-Lease $cur)) {
+            Log-Line "nested $Name $By (under $holder's lease, pid $($cur.pid))"
+            return @{ ok = $true; nested = $true; cur = $cur }
+        }
         $free = -not $holder -and (-not $first -or $first.by -eq $By)
         if ($mine -and -not $Ready) { return @{ ok = $false; turn = $true; mine = $true; cur = $cur } }
         if (($mine -or $free) -and $Ready) {
@@ -646,10 +685,13 @@ function Do-Unqueue([string]$Name) {
     }
 }
 function Do-Release([string]$Name, [switch]$Quiet) {
+    [void](My-Tree)
     With-Lock {
         $cur = Read-Lease $Name
         if (-not $cur) { return @{ ok = $true; msg = "$Name was not held" } }
         $state = Lease-State $cur
+        # A nested release (see Try-Take) gives back nothing: the lease is the parent's, and it ends with the parent's work.
+        if ($state -eq 'live' -and $cur.by -ne $By -and -not $Force -and (Under-Lease $cur)) { return @{ ok = $true; msg = "$Name stays $($cur.by)'s: you run under its process (nested), so there was nothing of yours to release" } }
         if ($state -eq 'live' -and $cur.by -ne $By -and -not $Force) { return @{ ok = $false; cur = $cur } }
         Remove-Lease $Name
         $how = if ($cur.by -ne $By) { "release-forced (was $($cur.by), $state)" } else { 'release' }
@@ -2254,6 +2296,7 @@ switch ($Verb) {
                 if (-not $Wait -or [DateTime]::UtcNow -ge $deadline) { throw }
                 Say "look failed, trying again: $($_.Exception.Message)" Yellow; Start-Sleep -Seconds 5; continue
             }
+            if ($res.ok -and $res.nested) { Say "$Lease is covered: you run under $($res.cur.by)'s lease (pid $($res.cur.pid)), so its work is yours too. Nothing taken; nothing to release." Green; exit 0 }
             if ($res.ok) {
                 $what = if ($res.renewed) { 'renewed' } else { 'taken' }
                 Say "$Lease $what by $(Describe-Lease $res.cur)" Green
@@ -2271,6 +2314,7 @@ switch ($Verb) {
     'renew' {
         Need-By; Need-Lease
         $cur = Read-Lease $Lease
+        if ($cur -and $cur.by -ne $By -and (Lease-State $cur) -eq 'live' -and (Under-Lease $cur)) { Say "$Lease is $($cur.by)'s and you run under it (nested): renew it as $($cur.by)" Green; exit 0 }
         if (-not $cur -or $cur.by -ne $By) { Fail "you ($By) don't hold $Lease; take it instead" 2 }
         $res = Try-Take $Lease (Lease-Minutes $Lease) ([int]$(if ($HolderPid) { $HolderPid } elseif ($cur.pid -and (Lease-State $cur) -eq 'live') { $cur.pid } else { 0 }))
         if (-not $res.ok) { Fail "$Lease lapsed and went on: $(Wait-Text $res $Lease)" 2 }
@@ -2385,6 +2429,7 @@ switch ($Verb) {
         $min = Lease-Minutes $Lease
         $res = Wait-Lease $Lease $min $tie ([DateTime]::UtcNow.AddMinutes($TimeoutMin)) ($Lease -eq $CardLease -and -not $NoQuiet)
         if (-not $res.ok) { Fail $res.msg $res.code }
+        if ($res.nested) { Say "$Lease is covered: you run under $($res.cur.by)'s lease (pid $($res.cur.pid)); nothing taken" Green; exit 0 }
         Say "$Lease held: $(Describe-Lease $res.cur)" Green
         exit 0
     }

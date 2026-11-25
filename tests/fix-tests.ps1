@@ -127,6 +127,28 @@ try {
     [void](T release gpu -By agent1); [void](T take gpu -By agent1)
     Check 'R4-2 a pid-less lease of yours: go' ((T check -Exe UnrealEditor.exe -ArgList 'P.uproject -game' -By agent1) -eq 0)
 
+    # Nested: a step started under the holder's own process asks for the same lease (a build script, a launcher's child)
+    $script:D = New-Dir 'nested'
+    [void](T take build -By outer -HolderPid $PID -EstMin 30)
+    Check 'nested take under the holder is covered, not queued' ((T take build -By inner -NoQueue) -eq 0 -and $out -match 'covered')
+    Check 'nested hold under the holder is covered' ((T hold build -By inner2 -NoQuiet -TimeoutMin 1) -eq 0 -and $out -match 'covered')
+    Check 'nested release gives back nothing' ((T release build -By inner) -eq 0 -and (Status).leases.build.lease.by -eq 'outer')
+    Check 'nothing was queued behind the parent' (@((Status).queues.build).Count -eq 0)
+    $sib = Sleeper
+    [void](T release build -By outer); [void](T take build -By outer -HolderPid $sib.Id)
+    Check 'a take from outside the holder''s tree still queues' ((T take build -By inner -NoQueue) -eq 2)
+
+    # The HUD feed's own command line names its services (COMFY=8188,IMAGEGEN=8391): it is not image generation
+    $script:D = New-Dir 'hud'
+    $fx = Join-Path $base 'hud-fixture.json'
+    Put $fx @{ gpu = @{ usedMB = 500; totalMB = 12288; util = 2 }; procs = @(
+        @{ pid = 9001; ppid = 4; name = 'pythonw.exe'; cmd = 'C:\Python313\pythonw.exe -u C:\x\wallpaper\thor_hud.py --port 47823 --services OLLAMA=11434,COMFY=8188,IMAGEGEN=8391'; agoSec = 600 },
+        @{ pid = 9002; ppid = 4; name = 'python.exe'; cmd = 'python.exe ComfyUI\main.py --listen'; agoSec = 600 }) }
+    $st = (& $Shell -NoProfile -File $thor status -Json -Dir $D -Fixture $fx | ConvertFrom-Json)
+    $script:out = ($st.reasons -join '; ')
+    Check 'the HUD feed is not image generation' (-not ($st.reasons | Where-Object { $_ -match 'pid 9001' }))
+    Check 'a real ComfyUI still is' ([bool]($st.reasons | Where-Object { $_ -match 'image generation.*pid 9002' }))
+
     # MCP: dates keep their zone, dash-led values stay values, booleans are booleans
     $md = New-Dir 'mcp'
     $nonAscii = "caf$([char]0xE9) $([char]0x2014) $([char]0x2713)"   # built from code points: Windows PowerShell 5.1 reads this file as ANSI
