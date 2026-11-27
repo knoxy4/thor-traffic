@@ -99,7 +99,11 @@ flowchart LR
   `jobs\*.json` and an append-only `lease.log`. Every read-modify-write happens under one named mutex, so two takes can
   never both win — and nothing blocks while holding it.
 - **Leases are files, not mutexes**, because an agent's tool call lives a few seconds and can't hold a handle. A lease has
-  an expiry and, optionally, a process: `run`, `hold` and dispatched jobs tie the lease to themselves, so it ends when they do.
+  an expiry and, optionally, a process: `run`, `hold` and dispatched jobs tie the lease to themselves, so it ends when they do —
+  and not before: a tied lease outlives its expiry while its process runs (the cop's cap, alarm and reaper handle one that overstays).
+  A take, `hold` or `run` from a process under that lease's own process (a build script the holder started asking for the
+  same lease) is **nested**: covered as it stands, never queued behind its own parent. Nesting is seen through the pid tie, so
+  a launcher that starts tools which take leases should `hold` (or `take -HolderPid <its pid>`) rather than take pid-less.
 - **Coverage** follows the process tree: the cop and the board treat the lease's process, its child, and every descendant
   as covered. One launcher can hold `build` + `gpu` at once.
 - **Jobs run detached** (WMI-created, headless console, no inherited handles), so `submit` returns immediately even when
@@ -124,6 +128,14 @@ flowchart LR
   or a job on the `editor` or `build` lease, logs `over-cap` once per cap, raises a toast and leaves a note for the holder. Nothing
   is stopped or released: stopping a `hold` would kill its caller's whole script.
 - **The queue plans around overruns.** A holder past its estimate counts as half the time left to its cap, at least 5 minutes.
+- **Jobs on one project don't trip over each other.** The leases are separate locks, but an editor, a commandlet, a `-game`
+  run and a C++ build of the same Unreal project share its editor dll and its assets, so a link fails with LNK1104 or a
+  save fails on a file the game holds open. The project gate holds a queued job while a clash on the same project runs: a
+  build waits for that project's editor, commandlets, `-game` runs and other builds; a commandlet waits for `-game` runs and
+  builds; a `-game` run waits for commandlets and builds; the editor waits for builds. The project comes from a `.uproject`
+  path or a `<Name>Editor Win64` target in the job's command, or in the script it runs. A job that shows Unreal but names no
+  project waits on every project. A held job stands aside, `job` shows why (`[gate: ...]`), and lease.log says so once.
+  `submit -NoGate` skips it. Plain `take`, `run` and `hold` are never gated.
 
 ## Leases at a glance
 
@@ -171,12 +183,34 @@ trains and serves models: a `gpu` lease, a `build` lease, and a plain `bench` le
 | `kinds.<kind>.noise` | the line `quiet` gives for it, with `{name}`, `{pid}`, `{cmd}`; a kind with no `noise` never makes the GPU noisy |
 | `kinds.<kind>.allow` | `AllowEditor` or `AllowBuild`: the switch that ignores it |
 | `kinds.<kind>.idleProbe` | `{ "url": ..., "idle": <regex>, "timeoutMs": 1000 }` for a daemon that stays up with nothing loaded (a model server, an image-generation queue). When the url answers in time and the answer matches, its process is neither noise for `quiet` nor a reason to keep the lease. No answer counts as busy. |
+| `gate` | optional: the project gate. `classes[]` (`{ class, match, notInPy }`, first match wins on the job's command and the scripts it names), `project[]` (regexes whose group 1 is the project), `clash` (`class -> [classes it waits for]`), `running` (`process kind -> class`), `leaseClass` (`lease -> class` for a job that names a project and nothing else), `noScan` (a regex on `-Exe` whose argument scripts aren't read). No `gate`, no gate. `profiles\unreal.json` has the preset's. |
 | `kinds.<kind>.neverStop` | it writes files that a kill would corrupt, so the cap never stops a job with one in its tree |
+| `kinds.<kind>.free` | it needs no lease (see Lease-free work below). Its rules are tried after all others, no lease may name it, and it must have `noise` |
 | `hooks[]` | `{ "on": <regex on the lease.log event>, "exe": ..., "args": ... }`: the cop starts `exe` detached for each matching line, with the event in `THOR_AT`, `THOR_EVENT`, `THOR_LEASE`, `THOR_BY`, `THOR_TEXT` and `THOR_LINE`, never in its command line. A webhook url is refused here: it goes in `THOR_WEBHOOK_URL` |
 
 Everything on one state folder has to use one profile. The dispatcher hands its own to the jobs it starts; give the cop
 and the board the same one, or put `thor.profile.json` beside `thor.ps1` and they all find it. A bad profile stops every
 verb with what is wrong. The board's row tags and some message wording still say Unreal things under another profile.
+
+### Lease-free work
+
+Some work is light enough that a queue costs more than it saves: a headless browser playtest of a 2D web game, say, that
+five agents want to run at once. Mark it free in your profile and it takes no lease, joins no queue and holds nobody up.
+It opts in with an explicit marker on its own command line, not a guess from the process name:
+
+```json
+"rules": [ { "kind": "webtest", "name": "(?i)^(node|chrome|chrome-headless-shell)\\.exe$", "cmd": "(?i)(^|[\\s\"])--thor-free=webtest(?=[\\s\"]|$)" } ],
+"kinds": { "webtest": { "free": true, "noise": "browser playtest: {name} pid {pid}" } }
+```
+
+```powershell
+.\thor.ps1 free -By pt1 -Exe node.exe -ArgList 'C:\work\smoke.cjs --thor-free=webtest' -For 'boot-and-play'
+```
+
+Timed work still wins both ways. A quiet wait counts a running free process as noise, so a `-Quiet` job waits for the
+playtests to end; and while the card lease is held by a take that waited for quiet, or is free with a quiet waiter first in
+line, `check` says `wait` (exit 3) and `free` waits before it starts anything. A free kind's rules go last, so the marker on a
+`-game` run doesn't make it free: it is still a `-game` run. `free` refuses anything the profile doesn't mark free.
 
 ## Command reference
 
@@ -187,8 +221,9 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `renew <lease> -By <who> [-EstMin] [-Minutes]` | Extend; `-EstMin` re-estimates and moves the queue's times and the cap. Never shortens. |
 | `release <lease> -By <who> [-Force]` | Give it back; it's kept for the first in line who can use it. `-Force` only for a holder that's gone. |
 | `unqueue <lease> -By <who>` | Leave a queue. |
-| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-NotBefore] [-Priority] [-Preemptible] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. `-NotBefore +<min>` or a time holds it back without holding the lease for it. `-Priority 0-9` orders the queue (higher first). A running `-Preemptible` job is stopped and queued again when a job of higher priority is first in line. |
+| `submit [lease] -By <who> -Exe <path> [-ArgList] [-WorkDir] [-EstMin] [-Quiet] [-NoQuiet] [-TimeoutMin] [-NotBefore] [-Priority] [-Preemptible] [-NoGate] [-Json]` | Queue a launch command; Thor starts it when the lease is yours. A `gpu` job waits for quiet only with `-Quiet` or one of `quiet`'s switches, and the job keeps them. An `editor` or `build` job waits unless `-NoQuiet`. `-NotBefore +<min>` or a time holds it back without holding the lease for it. `-Priority 0-9` orders the queue (higher first). A running `-Preemptible` job is stopped and queued again when a job of higher priority is first in line. The project gate holds it while a clash on its project runs; `-NoGate` skips that. |
 | `check -Exe <path> [-ArgList] [-By <who>] [-Json]` | Before a launch: the kind the profile sees, and per lease whether the cop would stop it, strike it or count it as the lease in use, and whether `<who>` holds it. Exit 2 when a lease it needs isn't theirs. |
+| `free -By <who> -Exe <path> [-ArgList] [-WorkDir] [-For] [-TimeoutMin 30]` | Run a lease-free kind: no take, no queue. Waits out timed work first (exit 3 at `-TimeoutMin`), returns the command's exit code; exit 2 for anything the profile doesn't mark free. |
 | `job [-JobId <id>] [-By <who>] [-Json] [-Cancel]` | A job's state, exit code and output tail, or the job list. `-Cancel` kills the tree. |
 | `stats [-Days 14] [-By <who>] [-Json]` | What jobs took against what they said: per kind of job, the median estimate, the median run, how many ran late, and the median wait. `submit` uses the same history: an estimate far under what jobs like it took gets an `estimate check` line (and `estimateHint` with `-Json`). |
 | `run -By <who> -Exe <path> [-ArgList] [-Lease gpu] [-NoQuiet]` | Wait in line, wait for quiet, take the lease, run, release, return the exit code. Waits for quiet on any lease unless `-NoQuiet`. |
@@ -224,6 +259,7 @@ verb with what is wrong. The board's row tags and some message wording still say
 | `THOR_WEBHOOK_URL` | — | the cop POSTs every lease.log line here as JSON (`at`, `event`, `lease`, `by`, `text`, `line`). Environment only, never a file |
 | `THOR_WEBHOOK_ON` | — | regex on the event: only matching lines go to the webhook (e.g. `^(cop-kill\|strike\|job-)`) |
 | `THOR_JOB_DAYS` | `30` | days a finished job's json and logs are kept; `0` keeps them all |
+| `THOR_MUTEX` | `ThorTraffic` | the base of the named mutexes (`Global\<base>_lease`, `_cop`, `_board`). Everything on one state folder must use the same one; a job carries it to its runner. Change it only to share a lock with another copy of the tool on the same folder |
 | `-ReapAfterMin` | `10` | minutes a lease stays idle past its estimate, with someone waiting, before the cop releases it; `0` turns that off |
 | `-ParkWarnMin` | `15` | minutes a wait for quiet runs before it logs `park-long`; then hourly |
 
@@ -281,6 +317,9 @@ covered by the repo's MIT license.
   you already start, but give it only to agents you'd let run commands anyway.
 - **`-NotBefore` needs a dispatch pass.** A job whose time has come starts on the next cop or board pass, or the next submit.
   With neither running, it waits.
+- **The project gate reads one level.** It sees a job's own command and the one script it is or names by an absolute path.
+  A script that calls another script hides what that one does: name the `.uproject` in the outer script, even in a comment.
+  Only submitted jobs are gated; a plain `take` or `run` beside a clash still clashes.
 - **One user.** Agents and the human run as the same Windows user; the state folder isn't an ACL boundary.
 
 ## Tests

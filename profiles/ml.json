@@ -43,7 +43,7 @@
     {
       "kind": "imagegen",
       "name": "(?i)^pythonw?\\.exe$",
-      "cmd": "(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen"
+      "cmd": "(?i)^(?!.*thor_hud\\.py).*(comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen)"
     },
     {
       "kind": "train",

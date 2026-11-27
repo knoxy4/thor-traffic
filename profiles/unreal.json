@@ -76,7 +76,7 @@
     {
       "kind": "imagegen",
       "name": "(?i)^pythonw?\\.exe$",
-      "cmd": "(?i)comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen"
+      "cmd": "(?i)^(?!.*thor_hud\\.py).*(comfy|diffusers|flux|stable.?diffusion|sd-?webui|forge|invokeai|imagegen)"
     },
     {
       "kind": "build",
@@ -120,5 +120,59 @@
       "noise": "build work: {name} pid {pid} (-AllowBuild to ignore)",
       "allow": "AllowBuild"
     }
+  },
+  "gate": {
+    "classes": [
+      {
+        "class": "build",
+        "match": "(?i)Build\\.bat|UnrealBuildTool|RunUBT\\.bat|RunUAT\\.bat|AutomationTool"
+      },
+      {
+        "class": "write",
+        "match": "(?i)^(?=[\\s\\S]*UnrealEditor)(?=[\\s\\S]*(^|[\\s\"])-run=)"
+      },
+      {
+        "class": "game",
+        "match": "(?i)^(?=[\\s\\S]*UnrealEditor)(?=[\\s\\S]*(^|[\\s\"])-(game|server)(?=[\\s\"]|$))"
+      },
+      {
+        "class": "editor",
+        "match": "(?i)UnrealEditor",
+        "notInPy": true
+      }
+    ],
+    "project": [
+      "(?i)([A-Za-z0-9_\\-]+)\\.uproject",
+      "(?i)\\b([A-Za-z0-9_]+)Editor\\s+Win64\\b"
+    ],
+    "clash": {
+      "build": [
+        "build",
+        "write",
+        "game",
+        "editor"
+      ],
+      "write": [
+        "build",
+        "game"
+      ],
+      "game": [
+        "build",
+        "write"
+      ],
+      "editor": [
+        "build"
+      ]
+    },
+    "running": {
+      "game": "game",
+      "commandlet": "write",
+      "editor": "editor",
+      "build": "build"
+    },
+    "leaseClass": {
+      "build": "build"
+    },
+    "noScan": "(?i)blender"
   }
 }

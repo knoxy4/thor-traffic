@@ -145,16 +145,89 @@ def gpu_stream():
         time.sleep(5)
 
 
+def parse_iso(s):
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+TICKS_1601 = 504911232000000000  # .NET ticks (from 0001-01-01) at the FILETIME epoch (1601-01-01)
+
+
+def proc_stamp(pid):
+    """The process's start as .NET UTC ticks (thor.ps1's pidStart), or None when it isn't running."""
+    if sys.platform != "win32" or not pid:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        code = wt.DWORD()
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+            return None
+        c, e, kk, u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+        if not k.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(kk), ctypes.byref(u)):
+            return ""
+        return str(((c.hi << 32) | c.lo) + TICKS_1601)
+    finally:
+        k.CloseHandle(h)
+
+
+def same_proc(pid, stamp):
+    st = proc_stamp(pid)
+    if st is None:
+        return False
+    return not stamp or not st or st == str(stamp)
+
+
+def lease_live(L, now):
+    """thor.ps1's Lease-State, as far as the panel needs it: live, or not (expired, or its process gone)."""
+    if not L or not L.get("by"):
+        return False
+    until = parse_iso(L.get("until"))
+    if until is not None and until <= now:
+        # a lease tied to a process keeps going past its expiry while that process runs (with a start stamp to tell it apart)
+        return bool(L.get("pid") and L.get("pidStart") and same_proc(L.get("pid"), L.get("pidStart")))
+    if L.get("pid") and not same_proc(L.get("pid"), L.get("pidStart")):
+        return False
+    return True
+
+
+def entry_live(e, now):
+    """A waiter thor.ps1 would still count: not past its drop time, and its process (if it has one) still up."""
+    until = parse_iso(e.get("until"))
+    if until is not None and until <= now:
+        return False
+    if e.get("pid") and not same_proc(e.get("pid"), e.get("pidStart")):
+        return False
+    return True
+
+
 def make_thor_stats(state_dir, lease_names):
     def thor_stats():
         now = time.time()
         leases = {}
+        queued_ids = set()
         for name in lease_names:
             L = read_json(os.path.join(state_dir, "leases", name + ".json")) or {}
             Q = read_json(os.path.join(state_dir, "queue", name + ".json")) or {}
+            live = lease_live(L, now)
+            entries = [e for e in (Q.get("entries") or []) if isinstance(e, dict) and entry_live(e, now)
+                       and not (live and e.get("by") == L.get("by"))]
+            queued_ids.update(str(e["job"]) for e in entries if e.get("job"))
+            if not live:
+                L = {}
             leases[name] = {"by": L.get("by"), "note": L.get("note"), "taken": L.get("taken"),
                             "eta": L.get("eta"), "until": L.get("until"),
-                            "queue": [{"by": e.get("by"), "note": e.get("note")} for e in (Q.get("entries") or [])]}
+                            "queue": [{"by": e.get("by"), "note": e.get("note")} for e in entries]}
         # sessions\ is optional (written by a session tracker, not by thor.ps1); null hides the panel's SESSIONS strip.
         sessions = None
         sd = os.path.join(state_dir, "sessions")
@@ -169,9 +242,10 @@ def make_thor_stats(state_dir, lease_names):
         jd = os.path.join(state_dir, "jobs")
         if os.path.isdir(jd):
             for e in os.scandir(jd):
-                if e.name.endswith(".json") and now - e.stat().st_mtime < 24 * 3600:
+                # a recent file, or a job still in a queue (one held back by -NotBefore can sit there for days)
+                if e.name.endswith(".json") and (now - e.stat().st_mtime < 24 * 3600 or e.name[:-5] in queued_ids):
                     J = read_json(e.path) or {}
-                    if J.get("state") in ("running", "queued", "waiting"):
+                    if J.get("state") in ("running", "starting", "queued"):
                         jobs.append({"id": J.get("id"), "lease": J.get("lease"), "note": J.get("note"),
                                      "state": J.get("state"), "started": J.get("started")})
         put("thor", {"order": lease_names, "leases": leases, "sessions": sessions, "jobs": jobs})
