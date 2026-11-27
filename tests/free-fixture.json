@@ -1,0 +1,7 @@
+{
+  "gpu": { "usedMB": 900, "totalMB": 12288, "util": 3 },
+  "procs": [
+    { "pid": 301, "ppid": 4, "name": "node.exe", "agoSec": 120, "cmd": "node.exe C:\\work\\smoke.cjs --thor-free=webtest" },
+    { "pid": 302, "ppid": 301, "name": "chrome.exe", "agoSec": 110, "cmd": "chrome.exe --headless --type=gpu-process" }
+  ]
+}

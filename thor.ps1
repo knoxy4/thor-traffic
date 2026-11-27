@@ -17,6 +17,7 @@
 #   thor.ps1 job    [-JobId <id>] [-By <who>] [-Json] [-Cancel]
 #   thor.ps1 stats   [-Days 14] [-By <who>] [-Json]
 #   thor.ps1 check   -Exe <path> [-ArgList '<args>'] [-By <who>] [-Json]
+#   thor.ps1 free    -By <who> -Exe <path> [-ArgList '<args>'] [-WorkDir <dir>] [-For 'what'] [-TimeoutMin 30]
 #   every verb: [-Dir <state folder>] [-ProfilePath <profile.json>]
 #   thor.ps1 run     -By <who> -Exe <path> [-ArgList '<args>'] [-Lease gpu] [-For 'what'] [-NoQuiet] [-TimeoutMin 60] (+ quiet's switches)
 #   & thor.ps1 hold  [gpu|editor|build] -By <who> [-For 'what'] [-HolderPid <pid>] [-NoQuiet] [-TimeoutMin 30] (+ quiet's switches)
@@ -156,9 +157,22 @@
 # <who> or one of its jobs holds it. Exit 2 when a lease it would be stopped or struck without isn't theirs (take it first),
 # else 0. mcp\thor-mcp.ps1 serves the verbs, check included, as MCP tools on stdio.
 #
-# Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first), 3 not quiet.
+# Lease-free kinds. A kind the profile marks free (kinds.<kind>.free) needs no lease: it never queues, never holds anyone up,
+# and the cop never stops or strikes it. It is for light work many agents run at once (a browser playtest of a 2D web game, say)
+# and it is opt-in by an explicit marker: its rule should match a flag the launcher passes on its own command line (for example
+# --thor-free=<lane> on the node or browser process), not a bare process name. Free kinds' rules are tried after every other
+# rule, so a marker never takes a process out of a kind that needs a lease: a -game run carrying it is still a -game run. A
+# profile may not name a free kind in any lease's busy, busyCpp, covers, strike or enforce, and must give it noise, because
+# timed work still sees it: a quiet wait counts a running free process as noise, so a -Quiet job waits for those to end. The
+# other way, a free run waits out timed work: while the card lease is held by a take that waited for quiet (run, hold, a -Quiet
+# job: its lease file says quiet) or is free with a quiet waiter first in its queue, check says wait (exit 3) and free waits.
+# free -By <who> -Exe ... is the launcher: it refuses (exit 2) a command that isn't a free kind, waits out timed work (exit 3
+# after -TimeoutMin), runs the command in this process, logs free and free-done in lease.log and exits with its exit code.
+#
+# Exit codes: 0 ok, 1 usage or error, 2 lease held by someone else (or kept for the queue's first; or free: not a free kind),
+# 3 not quiet (check and free: timed work is on).
 param(
-    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats', 'check')][string]$Verb,
+    [Parameter(Position = 0, Mandatory)][ValidateSet('status', 'take', 'renew', 'release', 'quiet', 'run', 'hold', 'unqueue', 'watch', 'cop', 'submit', 'job', 'stats', 'check', 'free')][string]$Verb,
     [Parameter(Position = 1)][string]$Lease,
     [string]$By,
     [string]$For = '',
@@ -236,6 +250,7 @@ function Quote-Arg([string]$S) { return '"' + ($S -replace '(\\+)$', '$1$1') + '
 # Kind rules, first match wins: name = regex on the process name, cmd = regex on its command line, cpp = it is a C++ build.
 # Kind traits: noise = the line `quiet` gives for it ({name}, {pid}, {cmd}); allow = the switch that ignores it;
 #   neverStop = it writes assets, so the overrun cap never stops a job with one in its tree.
+#   free = it needs no lease (header: Lease-free kinds); its rules are tried last, no lease may name it, and it needs noise.
 # hooks (a file only) = @( @{ on = regex on a lease.log event; exe; args } ): the cop starts exe for each matching line (see Sinks).
 #   idleProbe = @{ url; idle; timeoutMs } for a daemon that stays up with nothing loaded: when the url answers within timeoutMs
 #   (1000) and the answer matches the regex idle, a process of that kind is neither noise nor the lease in use. No answer = busy.
@@ -329,6 +344,13 @@ function Read-Profile([string]$Path) {
             if ($ip -isnot [Collections.IDictionary] -or [string]$ip.url -notmatch '^https?://' -or -not [string]$ip.idle) { & $bad "kind '$k': idleProbe needs a url (http or https) and idle (a regex on the answer)" }
             try { [void][regex]::new([string]$ip.idle) } catch { & $bad "kind '$k': idleProbe.idle is not a regex" }
         }
+        if ($t.kinds[$k].free) {
+            if (-not [string]$t.kinds[$k].noise) { & $bad "kind '$k' is free, so it needs noise: timed work waits for it" }
+            foreach ($w in @('allow', 'neverStop', 'idleProbe')) { if ($t.kinds[$k].Contains($w)) { & $bad "kind '$k' is free: $w means nothing for it" } }
+            foreach ($n in @($t.leases.Keys)) {
+                foreach ($f in @('busy', 'busyCpp', 'covers', 'strike', 'enforce')) { if (@($t.leases[$n][$f]) -contains $k) { & $bad "kind '$k' is free, so lease '$n' can't name it in $f" } }
+            }
+        }
     }
     $g = $t.gate
     if ($null -ne $g) {
@@ -378,6 +400,9 @@ foreach ($n in @($Traits.leases.Keys)) {
     foreach ($f in @('busy', 'busyCpp', 'covers', 'strike', 'enforce')) { $lt[$f] = @($lt[$f] | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
 }
 foreach ($r in @($Traits.rules)) { if ([string]$r.name -eq '{GameExe}') { $r.name = $GameExe } }
+# Free kinds' rules go last (first match wins), so a marker only names a process no other rule claims.
+$FreeKinds = @($Traits.kinds.Keys | Where-Object { $Traits.kinds[$_].free } | ForEach-Object { [string]$_ })
+$Traits.rules = @(@($Traits.rules | Where-Object { [string]$_.kind -notin $FreeKinds }) + @($Traits.rules | Where-Object { [string]$_.kind -in $FreeKinds }))
 $Hooks = @($Traits.hooks | Where-Object { $_ })
 $Names = @($Traits.leases.Keys)
 if ($Lease) {
@@ -710,6 +735,7 @@ function Try-Take([string]$Name, [int]$Min, [int]$TiePid, [bool]$Ready = $true, 
                 lease = $Name; by = $By; note = $(if ($mine -and -not $For) { [string]$cur.note } else { $For }); taken = $taken
                 until = Iso $untilT; est = $est; eta = Iso $etaT
                 pid = $null; pidStart = $null; childPid = $null; host = $env:COMPUTERNAME
+                quiet = ([bool]$NeedQuiet -or ($mine -and [bool]$cur.quiet))   # taken after a quiet wait: timed work (free runs wait it out)
             }
             if ($TiePid) { $new.pid = $TiePid; $new.pidStart = Pid-Stamp $TiePid }
             elseif ($mine -and $cur.pid) { $new.pid = $cur.pid; $new.pidStart = $cur.pidStart }   # the holder's own take again keeps its tie, like renew
@@ -1284,6 +1310,19 @@ function Quiet-Reasons($Gpu, $Procs, $Leases, [int[]]$SkipPids = @(), [string]$L
         $r.Add($kt.noise.Replace('{name}', [string]$p.name).Replace('{pid}', [string]$p.pid).Replace('{cmd}', [string]$p.cmd))
     }
     return , $r
+}
+function Timed-Work($Leases) {
+    # What a free run waits out (header: Lease-free kinds): the card lease taken after a quiet wait, or the card lease free with a
+    # waiter for quiet first in its queue (it is settling, or takes the lease the moment it can). '' when there is none.
+    $g = $Leases[$CardLease]
+    if ($g.state -eq 'live') {
+        if ($g.lease.quiet) { return "timed work holds the $CardLease lease: $(Describe-Lease $g.lease)" }
+        return ''
+    }
+    $now = [DateTime]::UtcNow
+    $w = @(Status-Queue $CardLease $g | Where-Object { -not $_.notBefore -or (To-Utc $_.notBefore) -le $now }) | Select-Object -First 1
+    if ($w -and $w.needQuiet) { return "timed work is next for the $CardLease lease and waits for a quiet GPU: $($w.by)$(if ($w.note) { " '$($w.note)'" })" }
+    return ''
 }
 function Wait-Quiet([DateTime]$Deadline) {
     # True once quiet held for SettleSec in a row; False at the deadline.
@@ -2470,6 +2509,7 @@ switch ($Verb) {
         foreach ($p in ($procs | Where-Object { $_.kind -notin $BuildKinds })) {
             $tag = ''
             if ($leasedPids -contains $p.pid) { $tag = '  [leased]' }
+            elseif ($p.kind -in $FreeKinds) { $tag = '  [lease-free]' }
             else {
                 # The lease this kind needs, by the profile: the card lease for what the cop stops, else a lease whose strike or covers names it.
                 $want = if ($p.kind -in @($Traits.leases[$CardLease].enforce)) { $CardLease } else { [string]($Names | Where-Object { $p.kind -in @($Traits.leases[$_].strike) -or $p.kind -in @($Traits.leases[$_].covers) } | Select-Object -First 1) }
@@ -2779,8 +2819,15 @@ switch ($Verb) {
         $missing = @($needs | Where-Object { -not $_.yours -and $_.without -in @('stopped', 'struck') })
         $verdict = if (-not $ck) { 'no kind' } elseif ($missing.Count) { 'take first' } else { 'go' }
         $rc = if ($missing.Count) { 2 } else { 0 }
+        $isFree = [bool]($ck -and $ck -in $FreeKinds); $timed = ''
+        if ($isFree) { $timed = Timed-Work $ls; if ($timed) { $verdict = 'wait'; $rc = 3 } else { $verdict = 'free' } }
         if ($Json) {
-            [pscustomobject][ordered]@{ exe = $Exe; args = $ArgList; kind = $ck; cpp = $ccpp; agentMarker = (Is-AgentRun $full); profile = [string]$Traits.name; leases = @($needs); verdict = $verdict } | ConvertTo-Json -Depth 4
+            [pscustomobject][ordered]@{ exe = $Exe; args = $ArgList; kind = $ck; cpp = $ccpp; free = $isFree; timed = $timed; agentMarker = (Is-AgentRun $full); profile = [string]$Traits.name; leases = @($needs); verdict = $verdict } | ConvertTo-Json -Depth 4
+            exit $rc
+        }
+        if ($isFree) {
+            Say "$leaf is a $ck to this profile ($($Traits.name)): lease-free, so no take, no queue, and the cop leaves it alone"
+            if ($timed) { Say "wait: $timed. Start it after; thor.ps1 free -By <who> -Exe ... waits for you" Yellow } else { Say 'go' Green }
             exit $rc
         }
         if (-not $ck) { Say "$leaf is no kind this profile ($($Traits.name)) knows: no lease covers it and the cop ignores it" Green; exit 0 }
@@ -2794,8 +2841,43 @@ switch ($Verb) {
         else { Say 'go' Green }
         exit $rc
     }
+    'free' {
+        # The launcher for a lease-free kind (header: Lease-free kinds): no take and no queue, only a wait for timed work to end.
+        Need-By
+        if (-not $Exe) { Fail 'free needs -Exe <path> (and -ArgList for its arguments)' }
+        $leaf = $Exe; try { $leaf = [IO.Path]::GetFileName($Exe) } catch {}
+        $full = "$Exe $ArgList".Trim(); $fk = $null
+        foreach ($r in $Traits.rules) {
+            if (-not $r.name -or $leaf -notmatch $r.name) { continue }
+            if ($r.cmd -and $full -notmatch $r.cmd) { continue }
+            $fk = [string]$r.kind; break
+        }
+        if (-not $fk -or $fk -notin $FreeKinds) {
+            Fail "$leaf is $(if ($fk) { "a $fk" } else { 'no kind' }) to this profile ($($Traits.name)), not a lease-free kind: free runs only what the profile marks free (its marker on the command line). Anything else: check, take or submit." 2
+        }
+        $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMin); $said = [DateTime]::MinValue; $lastT = ''
+        while ($true) {
+            $tw = Timed-Work (Get-Leases)
+            if (-not $tw) { break }
+            $now = [DateTime]::UtcNow
+            if ($now -ge $deadline) { Fail "timed work still on after $TimeoutMin min, nothing started: $tw" 3 }
+            if ($tw -ne $lastT -or ($now - $said).TotalSeconds -ge 60) { Say "waiting for timed work to end: $tw" Yellow; $said = $now; $lastT = $tw }
+            Start-Sleep -Seconds 5
+        }
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe; $psi.Arguments = $ArgList; $psi.UseShellExecute = $false
+        if ($WorkDir) { $psi.WorkingDirectory = $WorkDir }
+        try { $p = [Diagnostics.Process]::Start($psi) } catch { Fail "could not start: $($_.Exception.Message)" }
+        $null = $p.Handle
+        Log-Line "free $fk $By pid $($p.Id)$(if ($For) { " for: $For" }): $(Short-Cmd $leaf $full)"
+        Say "$fk is lease-free: started pid $($p.Id): $Exe $ArgList" Green
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        Log-Line "free-done $fk $By pid $($p.Id) exit $code"
+        exit $code
+    }
     'stats' {
-        $root = if ($By) { Lane-Root ($By.Trim().ToLower()) } else { '' }
+        $root =if ($By) { Lane-Root ($By.Trim().ToLower()) } else { '' }
         $all = @(Recent-Jobs ([int][Math]::Ceiling($Days * 24)) | Where-Object { -not $root -or (Lane-Root ([string]$_.by)) -eq $root })
         $kinds = @(Job-Stats $Days $root)
         $ran = 0; foreach ($r in $kinds) { $ran += [int]$r.n }
