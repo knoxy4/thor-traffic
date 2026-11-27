@@ -1,0 +1,17 @@
+{
+  "name": "free-test",
+  "leases": {
+    "gpu": { "minutes": 30, "card": true, "busy": ["game"], "enforce": ["game"] },
+    "build": { "minutes": 60, "busyCpp": ["build"], "covers": ["build"], "strike": ["build"] }
+  },
+  "rules": [
+    { "kind": "webtest", "name": ".*", "cmd": "(?i)(^|[\\s\"])--thor-free=webtest(?=[\\s\"]|$)" },
+    { "kind": "game", "name": "(?i)^UnrealEditor\\.exe$", "cmd": "(?i)(^|\\s)-game(\\s|$)" },
+    { "kind": "build", "name": "(?i)^UnrealBuildTool\\.exe$", "cpp": true }
+  ],
+  "kinds": {
+    "game": { "noise": "-game run: pid {pid} {cmd}" },
+    "build": { "noise": "build work: {name} pid {pid}" },
+    "webtest": { "free": true, "noise": "browser playtest: {name} pid {pid}" }
+  }
+}
