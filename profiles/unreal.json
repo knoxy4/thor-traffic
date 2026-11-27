@@ -173,6 +173,9 @@
     "leaseClass": {
       "build": "build"
     },
-    "noScan": "(?i)blender"
+    "noScan": "(?i)blender",
+    "path": [
+      "(?i)([A-Za-z]:[\\/](?:(?![A-Za-z]:[\\/])[^\"*?<>|\\r\\n])*?\\.uproject)"
+    ]
   }
 }

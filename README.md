@@ -133,7 +133,8 @@ flowchart LR
   save fails on a file the game holds open. The project gate holds a queued job while a clash on the same project runs: a
   build waits for that project's editor, commandlets, `-game` runs and other builds; a commandlet waits for `-game` runs and
   builds; a `-game` run waits for commandlets and builds; the editor waits for builds. The project comes from a `.uproject`
-  path or a `<Name>Editor Win64` target in the job's command, or in the script it runs. A job that shows Unreal but names no
+  path or a `<Name>Editor Win64` target in the job's command, or in the script it runs. Two copies of one project in
+  different folders are two projects when both sides name the `.uproject` by its full path; a side that gives only the name waits on every copy. A job that shows Unreal but names no
   project waits on every project. A held job stands aside, `job` shows why (`[gate: ...]`), and lease.log says so once.
   `submit -NoGate` skips it. Plain `take`, `run` and `hold` are never gated.
 
@@ -183,7 +184,7 @@ trains and serves models: a `gpu` lease, a `build` lease, and a plain `bench` le
 | `kinds.<kind>.noise` | the line `quiet` gives for it, with `{name}`, `{pid}`, `{cmd}`; a kind with no `noise` never makes the GPU noisy |
 | `kinds.<kind>.allow` | `AllowEditor` or `AllowBuild`: the switch that ignores it |
 | `kinds.<kind>.idleProbe` | `{ "url": ..., "idle": <regex>, "timeoutMs": 1000 }` for a daemon that stays up with nothing loaded (a model server, an image-generation queue). When the url answers in time and the answer matches, its process is neither noise for `quiet` nor a reason to keep the lease. No answer counts as busy. |
-| `gate` | optional: the project gate. `classes[]` (`{ class, match, notInPy }`, first match wins on the job's command and the scripts it names), `project[]` (regexes whose group 1 is the project), `clash` (`class -> [classes it waits for]`), `running` (`process kind -> class`), `leaseClass` (`lease -> class` for a job that names a project and nothing else), `noScan` (a regex on `-Exe` whose argument scripts aren't read). No `gate`, no gate. `profiles\unreal.json` has the preset's. |
+| `gate` | optional: the project gate. `classes[]` (`{ class, match, notInPy }`, first match wins on the job's command and the scripts it names), `project[]` (regexes whose group 1 is the project), `clash` (`class -> [classes it waits for]`), `running` (`process kind -> class`), `leaseClass` (`lease -> class` for a job that names a project and nothing else), `noScan` (a regex on `-Exe` whose argument scripts aren't read), `path[]` (regexes whose group 1 is the project file's full path: same-named projects in different folders don't clash). No `gate`, no gate. `profiles\unreal.json` has the preset's. |
 | `kinds.<kind>.neverStop` | it writes files that a kill would corrupt, so the cap never stops a job with one in its tree |
 | `kinds.<kind>.free` | it needs no lease (see Lease-free work below). Its rules are tried after all others, no lease may name it, and it must have `noise` |
 | `hooks[]` | `{ "on": <regex on the lease.log event>, "exe": ..., "args": ... }`: the cop starts `exe` detached for each matching line, with the event in `THOR_AT`, `THOR_EVENT`, `THOR_LEASE`, `THOR_BY`, `THOR_TEXT` and `THOR_LINE`, never in its command line. A webhook url is refused here: it goes in `THOR_WEBHOOK_URL` |

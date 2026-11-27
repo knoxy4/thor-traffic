@@ -84,8 +84,9 @@
 #   editor (UnrealEditor.exe, neither)         waits for a build of it
 # The job's class and project come from its -Exe and -ArgList (an -EncodedCommand or -ArgListB64 is decoded; a .ps1, .bat, .cmd
 # or .py given as -Exe or named by an absolute path in the arguments is read, its first 200 lines, when they alone don't tell),
-# the project from a .uproject path or a "<Name>Editor Win64" target. What runs comes from the box and from jobs already starting
-# or running, so two jobs dispatched a second apart can't both go. A job that shows Unreal but names no project counts as every
+# the project from a .uproject path or a "<Name>Editor Win64" target. Two copies of one project in different folders are two
+# projects when both sides name their .uproject by its full path; a side that gives only the name counts as every copy.
+# What runs comes from the box and from jobs already starting or running, so two jobs dispatched a second apart can't both go. A job that shows Unreal but names no project counts as every
 # project, held and holding: name its .uproject, even in a comment in its script, to narrow it. A .py that only names the editor
 # is usually asking whether it is up, so it needs a build, a -game or a -run= to count. Packaged runs load neither file and never
 # clash, and a job with no sign of Unreal is never held. A held job keeps its queue place but stands aside (see Standing aside),
@@ -260,6 +261,7 @@ function Quote-Arg([string]$S) { return '"' + ($S -replace '(\\+)$', '$1$1') + '
 #   clash = @{ <class> = @(classes it waits for) }. running = @{ <process kind> = <class> }: what runs on the box (a busyCpp kind
 #   counts only as a C++ build). leaseClass = @{ <lease> = <class> } for a job that names a project but shows no class.
 #   noScan = a regex on -Exe: the scripts named in its arguments are not read (Blender's .py says nothing about Unreal).
+#   path = regexes whose group 1 is a project file's full path: same-named projects whose paths both show and differ don't clash.
 $Traits = @{
     name = 'unreal'
     leases = [ordered]@{
@@ -301,6 +303,7 @@ $Traits = @{
         running = @{ game = 'game'; commandlet = 'write'; editor = 'editor'; build = 'build' }
         leaseClass = @{ build = 'build' }
         noScan = '(?i)blender'
+        path = @('(?i)([A-Za-z]:[\\/](?:(?![A-Za-z]:[\\/])[^"*?<>|\r\n])*?\.uproject)')
     }
 }
 function To-Hash($o) {
@@ -374,6 +377,10 @@ function Read-Profile([string]$Path) {
         }
         foreach ($f in @('running', 'leaseClass')) { foreach ($k in @($g[$f].Keys)) { if ($cls -notcontains [string]$g[$f][$k]) { & $bad "gate: $f.$k is '$($g[$f][$k])', which no class defines" } } }
         if ($g.noScan) { & $rx $g.noScan 'noScan' }
+        if ($null -ne $g.path) {
+            if ($g.path -is [Collections.IDictionary]) { & $bad 'gate: path must be an array of regexes whose group 1 is a project file path' }
+            foreach ($p in @($g.path)) { & $rx $p 'a path pattern'; if (([regex]::new([string]$p)).GetGroupNumbers() -notcontains 1) { & $bad "gate: path pattern '$p' has no group 1" } }
+        }
     }
     foreach ($w in @('webhook', 'webhookUrl', 'url')) { if ($t.Contains($w)) { & $bad "a webhook url lives in `$env:THOR_WEBHOOK_URL only, never in a file (it often carries a token)" } }
     if ($null -eq $t.hooks) { $t.hooks = @() }
@@ -964,6 +971,24 @@ function Gate-Project([string]$T) {
     foreach ($p in @($Traits.gate.project)) { $m = [regex]::Match($T, [string]$p); if ($m.Success -and $m.Groups[1].Value) { return $m.Groups[1].Value.ToUpperInvariant() } }
     return ''
 }
+function Gate-Path([string]$T, [string]$Proj) {
+    # The project file's full path, when the text gives one whose file is that project: two copies of one project in different
+    # folders don't share a dll or assets. Lower case, one kind of slash.
+    if (-not $T -or -not $Proj) { return '' }
+    foreach ($p in @($Traits.gate.path)) {
+        foreach ($m in [regex]::Matches($T, [string]$p)) {
+            $v = ($m.Groups[1].Value.Trim().Trim('"') -replace '/', '\' -replace '\\+', '\').ToLowerInvariant()
+            if ([IO.Path]::GetFileNameWithoutExtension($v).ToUpperInvariant() -eq $Proj) { return $v }
+        }
+    }
+    return ''
+}
+function Same-Project($A, $B) {
+    # One name is one project unless both sides name its file, and the files differ.
+    if ($A.unnamed -or $B.unnamed) { return $true }
+    if ($A.proj -ne $B.proj) { return $false }
+    return (-not $A.path -or -not $B.path -or $A.path -eq $B.path)
+}
 function Gate-Class([string]$GExe, [string]$GArgs, [string]$GLease) {
     $t = "$GExe $GArgs"
     $m = [regex]::Match($GArgs, '(?i)-ArgListB64\s+"?([A-Za-z0-9+/=]+)')
@@ -972,6 +997,7 @@ function Gate-Class([string]$GExe, [string]$GArgs, [string]$GLease) {
     if ($m.Success) { try { $t += ' ' + [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($m.Groups[2].Value)) } catch {} }
     $cls = Gate-Kind $t
     $proj = Gate-Project $t
+    $path = Gate-Path $t $proj
     if (-not $cls -or -not $proj) {
         # A wrapper (-Exe x.cmd, -File x.ps1, cmd /c x.bat, python x.py) hides what it runs: read the script it is, or names.
         $wrappers = @()
@@ -984,13 +1010,14 @@ function Gate-Class([string]$GExe, [string]$GArgs, [string]$GLease) {
                 $body = (Get-Content -LiteralPath $wp -TotalCount 200 -ErrorAction Stop) -join ' '
                 if (-not $cls) { $cls = Gate-Kind $body -Py:($wp -match '(?i)\.py$') }
                 if (-not $proj) { $proj = Gate-Project $body }
+                if ($proj -and -not $path) { $path = Gate-Path $body $proj }
             } catch {}
         }
     }
     # A class but no project: it could be any of them. The lease alone isn't that sign (Blender runs on the build lease).
     $unnamed = [bool]$cls -and -not $proj
     if (-not $cls -and $Traits.gate.leaseClass -and $Traits.gate.leaseClass[$GLease]) { $cls = [string]$Traits.gate.leaseClass[$GLease] }
-    return @{ cls = $cls; proj = $proj; unnamed = $unnamed }
+    return @{ cls = $cls; proj = $proj; path = $path; unnamed = $unnamed }
 }
 function Gate-Running {
     # What runs now, by project: the box's processes of a gated kind, plus jobs already starting or running.
@@ -999,13 +1026,13 @@ function Gate-Running {
         $c = [string]$Traits.gate.running[[string]$p.kind]
         if (-not $c -or ($BuildKinds -contains [string]$p.kind -and -not $p.cpp)) { continue }
         $pj = Gate-Project ([string]$p.full)
-        if ($pj) { $out.Add([pscustomobject]@{ cls = $c; proj = $pj; unnamed = $false; what = "$($p.name) pid $($p.pid)" }) }
+        if ($pj) { $out.Add([pscustomobject]@{ cls = $c; proj = $pj; path = (Gate-Path ([string]$p.full) $pj); unnamed = $false; what = "$($p.name) pid $($p.pid)" }) }
     }
     foreach ($oj in (Recent-Jobs 13)) {
         if ([string]$oj.state -notin @('starting', 'running')) { continue }
         if ([string]$oj.state -eq 'starting' -and $oj.waiting) { continue }   # still waiting for quiet: it has started nothing
         $g = Gate-Class ([string]$oj.exe) ([string]$oj.args) ([string]$oj.lease)
-        if ($g.cls -and ($g.proj -or $g.unnamed)) { $out.Add([pscustomobject]@{ cls = $g.cls; proj = $g.proj; unnamed = $g.unnamed; what = "job $($oj.runBy)" }) }
+        if ($g.cls -and ($g.proj -or $g.unnamed)) { $out.Add([pscustomobject]@{ cls = $g.cls; proj = $g.proj; path = $g.path; unnamed = $g.unnamed; what = "job $($oj.runBy)" }) }
     }
     return , $out
 }
@@ -1017,7 +1044,7 @@ function Gate-Reason($J) {
     $clash = @($Traits.gate.clash[$g.cls])
     if (-not $clash.Count) { return '' }
     if ($null -eq $script:GateRun) { $script:GateRun = Gate-Running }
-    $hit = @($script:GateRun | Where-Object { ($g.unnamed -or $_.unnamed -or $_.proj -eq $g.proj) -and $clash -contains $_.cls })
+    $hit = @($script:GateRun | Where-Object { (Same-Project $g $_) -and $clash -contains $_.cls })
     if (-not $hit.Count) { return '' }
     $who = @($hit | ForEach-Object { "$($_.cls) ($($_.what))" } | Select-Object -Unique) -join ', '
     $why = "$(if ($g.unnamed) { 'no project named:' } else { $g.proj }) $($g.cls) clashes with $who"

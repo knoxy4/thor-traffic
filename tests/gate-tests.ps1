@@ -94,6 +94,19 @@ try {
     Check 'a -game job waits for a running build job of its project' ([string]$j.state -eq 'queued' -and [string]$j.gate -match 'job ci\.j1')
     [void](Wait-Job $first @('done', 'failed'))
 
+    # A scratch copy of a project in another folder is another project, when both sides name their .uproject by its full path.
+    $script:D = New-Dir 'copies'
+    $copyBox = Box 'copy' @(Proc 204 'dotnet.exe' 'dotnet.exe UnrealBuildTool.dll OutpostEditor Win64 Development -Project=X:\Scratch\copy1\Outpost.uproject')
+    [void](T submit gpu -By ci -Exe cmd.exe -ArgList '/c exit 0 & rem UnrealEditor.exe C:\Proj\Outpost\Outpost.uproject -game' -Fixture $copyBox @quiet)
+    Check 'a -game run of a project is not held by a build of its copy in another folder' ([string](Wait-Job (LastId) @('done', 'failed')).state -eq 'done')
+    [void](T submit gpu -By ci -Exe cmd.exe -ArgList '/c exit 0 & rem UnrealEditor.exe x:/scratch/COPY1/Outpost.uproject -game' -Fixture $copyBox @quiet)
+    Check 'the same file, spelled another way, still clashes' ([string](Job (LastId)).gate -match 'OUTPOST game clashes with build')
+    [void](T submit gpu -By ci -Exe cmd.exe -ArgList '/c exit 0 & rem UnrealEditor.exe Outpost.uproject -game' -Fixture $copyBox @quiet)
+    Check 'a job naming the project without a path still waits for any copy' ([string](Job (LastId)).gate -match 'OUTPOST game clashes with build')
+    $spaceBox = Box 'space' @(Proc 205 'UnrealEditor.exe' '"C:\Program Files\Epic\UE_5.4\UnrealEditor.exe" "D:\My Games\Outpost\Outpost.uproject"')
+    [void](T submit build -By ci -Exe cmd.exe -ArgList '/c exit 0 & rem Build.bat OutpostEditor Win64 -Project="D:\My Games\Outpost\Outpost.uproject"' -Fixture $spaceBox @quiet)
+    Check 'a path with spaces after the editor''s own path is read as the project''s' ([string](Job (LastId)).gate -match 'OUTPOST build clashes with editor')
+
     # THOR_MUTEX renames the lock, so another copy of the tool on the same folder can share it; a job carries it to its runner.
     $script:D = New-Dir 'mutex'
     $env:THOR_MUTEX = 'ThorGateTest' + [Guid]::NewGuid().ToString('N').Substring(0, 6)
